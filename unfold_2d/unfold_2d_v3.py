@@ -1027,7 +1027,12 @@ def write_dxf(layout, out_path):
         pts = res['points']
         origin = pts[0]
         rot = angle_of(pts[0], pts[1]) if len(pts) > 1 else 0.0
-        local = [rot_pt(p, -rot, origin) for p in pts]
+        # 局部坐标 = 相对 origin 的坐标再转 -rot（2026-11-17 修：原代码只转
+        # -rot 未减 origin，局部坐标仍是绝对坐标，INSERT 再加一次 insert
+        # 点导致整根管子位移 R(rot)·origin——IP 实测 Body.123 被推出近 1 米；
+        # v3/v4 的 DXF 都有此问题，查看器读 layout.json 不受影响）
+        local = [(q[0] - origin[0], q[1] - origin[1])
+                 for q in (rot_pt(p, -rot, origin) for p in pts)]
         blk_name = sanitize_block_name('TUBE_' + key)
         blk = doc.blocks.new(name=blk_name)
         blk.add_lwpolyline(local, dxfattribs={'layer': 'TUBE'})

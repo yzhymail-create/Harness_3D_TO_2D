@@ -4,6 +4,9 @@
 用法：python3 make_viewer.py <layout.json> <out.html>
 2026-11-17 手机端修复：初始适配按可见视口铺满（100dvh + 底部导航预留 64px，
 viewBox 边距约 8%）、窄屏图例改顶部可折叠（默认收起）、标签加白晕 + 放大时变大。
+2026-11-17 v5：标题/版本号取 layout.json meta 的 version；顶部新增主干路径行
+（端点/总长/分支数/关节数/直线跨度）；主干路径分支画红色加粗 + 图例项；
+点管子弹窗显示其在主干路径中的序号。旧版 layout.json（无 trunk_path）兼容。
 """
 import json, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +22,11 @@ def main():
     stats = d['stats']
     branches, nodes = d['branches'], d['nodes']
     bends, warnings = d['bends'], d['warnings']
+    version = d.get('meta', {}).get('version', 'v3')
+    trunk_path = d.get('meta', {}).get('trunk_path')  # v5：主干路径（旧版无则不显示）
+    trunk_keys = set(trunk_path['branch_list']) if trunk_path else set()
+    from datetime import date as _date
+    today = _date.today().isoformat()
     xmin, ymin, xmax, ymax = stats['bbox']
     # 边距：约 8%（各边取总尺寸的 4%），初始适配时图占满视口约 92%
     M = round(0.04 * max(xmax - xmin, ymax - ymin), 1)
@@ -31,12 +39,16 @@ def main():
 
     # ---- 静态 SVG 内容（Python 生成，便于离线核对元素数） ----
     parts = []
-    # 管子折线
+    # 管子折线（v5：主干路径分支画红色加粗，一眼可见整条主干是否拉直）
     for b in branches:
         pts = ' '.join(f"{x:.2f},{Y(y):.2f}" for x, y in b['points'])
+        if b['key'] in trunk_keys:
+            stroke, sw = '#d62728', '2.6'
+        else:
+            stroke, sw = '#2c5f8a', '1.6'
         parts.append(
             f'<polyline class="tube" data-key="{b["key"]}" points="{pts}" '
-            f'fill="none" stroke="#2c5f8a" stroke-width="1.6" stroke-linejoin="round" '
+            f'fill="none" stroke="{stroke}" stroke-width="{sw}" stroke-linejoin="round" '
             f'stroke-linecap="round"><title>{b["key"]} Φ{b["dia"]} L={b["len_3d"]}</title></polyline>')
     # 节点圆 + 编号
     for n in nodes:
@@ -75,8 +87,9 @@ def main():
         'checklist': d.get('checklist'),
         'crossings': d.get('crossings', []),
         'trunk': d.get('meta', {}).get('trunk'),
+        'trunk_path': trunk_path,
         'tilt_deg': d.get('meta', {}).get('tilt_deg'),
-        'version': d.get('meta', {}).get('version', 'v3'),
+        'version': version,
     }, ensure_ascii=False).replace('<', '\\u003c')
 
     n_seg = sum(len(b['pieces']) for b in branches)
@@ -139,12 +152,23 @@ def main():
         ck_verify = (f'<br>主干居中偏差 {dev_txt}{h1_mark} · '
                      f'硬规则 {n_pass}/{len(hard)} 通过 {all_mark}')
 
+    # ---- 主干路径行（v5：顶部显示路径端点/总长/分支数；旧版 layout.json 无则不显示） ----
+    trunk_header = ''
+    if trunk_path:
+        ep = trunk_path['endpoints']
+        trunk_header = (
+            f'<div class="stats">主干路径 <b>{ep[0]} → {ep[1]}</b> · '
+            f'总长 <b>{trunk_path["length_mm"]} mm</b> · '
+            f'<b>{trunk_path["branches"]} 根分支</b> · {trunk_path["joints"]} 个关节 · '
+            f'直线跨度 {trunk_path["span_mm"]} mm</div>')
+    legend_trunk = ('<span style="display:inline-block;width:16px;height:0;border-top:3px solid #d62728;margin-right:5px;vertical-align:middle"></span>主干路径<br>' if trunk_path else '')
+
     html_doc = f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>仪表线束 2D展开图 v4（2026-11-17）</title>
+<title>仪表线束 2D展开图 {version}（{today}）</title>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 body {{ font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f1f3f5; color: #212529; height: 100vh; height: -webkit-fill-available; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }}
@@ -195,8 +219,9 @@ header h1 {{ font-size: 16px; font-weight: 600; }}
 </head>
 <body>
 <header>
-<h1>仪表线束（IP-Harness）2D 展开图 · v4</h1>
+<h1>仪表线束（IP-Harness）2D 展开图 · {version}</h1>
 <div class="stats">分支 <b>{stats['branches_placed']}/{stats['branches_total']}</b> · 节点 <b>{stats['nodes_placed']}/{stats['nodes_total']}</b> · 线段 <b>{n_seg}</b> · 展开总长 <b>{total_len:.1f} mm</b> · 图纸 <b>{w_mm} × {h_mm} mm</b></div>
+{trunk_header}
 {ck_header}
 <div class="bar">
 <input id="search" type="text" placeholder="搜编号，如 CON01 / CLP01 / BN02 / Body.123" autocomplete="off">
@@ -211,7 +236,7 @@ header h1 {{ font-size: 16px; font-weight: 600; }}
 {svg_inner}
 </g>
 </svg>
-<div class="legend" id="legend"><button id="legendToggle" type="button">图例 ▸</button><div class="legend-body"><span class="ln"></span>管子（分支）<br><i style="background:#e03131"></i>连接器 <i style="background:#2f9e44"></i>卡扣 <i style="background:#f08c00"></i>分支点 <i style="background:#868e96"></i>接头<br><span style="color:#e03131;font-weight:700">✕</span> X 交叉点</div></div>
+<div class="legend" id="legend"><button id="legendToggle" type="button">图例 ▸</button><div class="legend-body">{legend_trunk}<span class="ln"></span>管子（分支）<br><i style="background:#e03131"></i>连接器 <i style="background:#2f9e44"></i>卡扣 <i style="background:#f08c00"></i>分支点 <i style="background:#868e96"></i>接头<br><span style="color:#e03131;font-weight:700">✕</span> X 交叉点</div></div>
 <div id="verify">拐弯 {stats['bends']} 次 · 残留干涉 {stats['residual_interference_pairs']} 对<br>（X 交叉 {n_x} 对 · 间距&lt;5mm {n_near} 对 · 压着画 {n_ov} 对）<br>最大长度误差 {stats['max_len_err_mm']} mm · 无真实几何环{ck_verify}</div>
 <div id="popup"><button class="x" id="btnClose">×</button><div id="popBody"></div></div>
 <div id="toast"></div>
@@ -228,6 +253,10 @@ var nodesByCode = {{}};
 DATA.nodes.forEach(function(n) {{ nodesByCode[n.code] = n; }});
 var branchesByKey = {{}};
 DATA.branches.forEach(function(b) {{ branchesByKey[b.key] = b; }});
+var trunkIdx = {{}};
+if (DATA.trunk_path && DATA.trunk_path.branch_list) {{
+  DATA.trunk_path.branch_list.forEach(function(k, i) {{ trunkIdx[k] = i + 1; }});
+}}
 
 // ---- 视图变换（平移 + 缩放） ----
 var view = {{ x: 0, y: 0, k: 1 }};
@@ -377,7 +406,11 @@ function showBranch(key) {{
   var bs = DATA.bends.filter(function(x) {{ return x.branch === key; }});
   var bendTxt = bs.length ? bs.map(function(x) {{ return x.seg + ' @' + x.at + ' ' + (typeof x.delta === 'number' ? (x.delta > 0 ? '+' : '') + x.delta + '°' : x.delta) + '（' + x.note + '）'; }}).join('<br>') : '无';
   var segs = b.pieces.map(function(p) {{ return p.seg + ' ' + p.na + '→' + p.nb; }}).join('<br>');
-  var rows = '<tr><td class="k">直径</td><td>Φ' + b.dia + ' mm</td></tr>'
+  var trunkRow = '';
+  if (trunkIdx[key]) {{
+    trunkRow = '<tr><td class="k">主干路径</td><td>是 · 第 ' + trunkIdx[key] + ' / ' + DATA.trunk_path.branches + ' 根</td></tr>';
+  }}
+  var rows = trunkRow + '<tr><td class="k">直径</td><td>Φ' + b.dia + ' mm</td></tr>'
     + '<tr><td class="k">3D 弧长</td><td>' + b.len_3d + ' mm</td></tr>'
     + '<tr><td class="k">2D 长度</td><td>' + b.len_2d + ' mm</td></tr>'
     + '<tr><td class="k">端点</td><td class="mono">' + esc(b.node0) + ' → ' + esc(b.node1) + '</td></tr>'
