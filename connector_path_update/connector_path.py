@@ -46,40 +46,53 @@ def _is_better(candidate, best):
 
 
 def _tree_diameter(connectors, component_nodes, component_edges, adj, edges):
-    """树中连接器终端集合的加权直径；两次树遍历即可精确求解。"""
+    """树中连接器终端集合的加权直径；两次 O(V+E) 遍历精确求解。"""
     if len(connectors) < 2:
         return None
 
-    def farthest(start):
-        stack = [(start, None, 0.0, [start], [])]
-        far_node, far_dist, far_nodes, far_edges = None, -1.0, None, None
+    def farthest(start, keep_parents=False):
+        stack = [(start, None, 0.0)]
+        parent = {start: None}
+        parent_edge = {}
+        far_node, far_dist = None, -1.0
         while stack:
-            node, parent, dist, node_path, edge_path = stack.pop()
+            node, prev, distance = stack.pop()
             if node in connectors and node != start:
-                if (dist > far_dist + _EPS or
-                        (abs(dist - far_dist) <= _EPS and
+                if (distance > far_dist + _EPS or
+                        (abs(distance - far_dist) <= _EPS and
                          (far_node is None or node < far_node))):
-                    far_node, far_dist = node, dist
-                    far_nodes, far_edges = node_path, edge_path
+                    far_node, far_dist = node, distance
             for nxt, eid in reversed(adj[node]):
-                if nxt == parent:
+                if nxt == prev:
                     continue
-                stack.append((nxt, node, dist + edges[eid]["length"],
-                              node_path + [nxt], edge_path + [eid]))
-        return far_node, far_dist, far_nodes, far_edges
+                parent[nxt] = node
+                parent_edge[nxt] = eid
+                stack.append((nxt, node, distance + edges[eid]["length"]))
+        return far_node, far_dist, parent, parent_edge
 
     first, _, _, _ = farthest(connectors[0])
     if first is None:
         return None
-    second, _, node_path, edge_path = farthest(first)
+    second, _, parent, parent_edge = farthest(first, keep_parents=True)
     if second is None:
         return None
+
+    # 只在找到端点后回溯一次，避免每个 DFS 状态复制整条路径。
+    node_path, edge_path = [second], []
+    current = second
+    while current != first:
+        edge_path.append(parent_edge[current])
+        current = parent[current]
+        node_path.append(current)
+    node_path.reverse()
+    edge_path.reverse()
+
     if first <= second:
         source, target = first, second
     else:
         source, target = second, first
-        node_path = list(reversed(node_path))
-        edge_path = list(reversed(edge_path))
+        node_path.reverse()
+        edge_path.reverse()
     return _path_record(source, target, edge_path, node_path, edges)
 
 
