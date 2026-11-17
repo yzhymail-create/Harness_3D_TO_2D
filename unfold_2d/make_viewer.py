@@ -7,6 +7,31 @@ viewBox 边距约 8%）、窄屏图例改顶部可折叠（默认收起）、标
 2026-11-17 v5：标题/版本号取 layout.json meta 的 version；顶部新增主干路径行
 （端点/总长/分支数/关节数/直线跨度）；主干路径分支画红色加粗 + 图例项；
 点管子弹窗显示其在主干路径中的序号。旧版 layout.json（无 trunk_path）兼容。
+2026-11-17 点按再修（用户真机反馈）：①终端节点圆点屏幕半径 12px（旧公式漏乘
+viewBox→屏幕 base 比例，实际仅约 1.5px），同类型统一尺寸；②点按按距离取最近，
+节点不再无条件优先，点线中部弹管子；③点按判定放宽到 700ms / 位移 12px，适应真人
+手指；④点节点时相连的线不变色，点管子时端点不高亮，选中什么只亮什么；⑤线粗
+统一 8px（= 终端节点直径 24px 的 1/3，与圆点协调），选中 12px，选线容差 20px；
+⑥每根管子中点上方标长度（3D 弧长四舍五入取整，放大 1.5 倍后显示，字号统一 11px）。
+另修：nearestTubeDist 须把 viewBox 坐标逆变换到 vp 局部坐标再算距离，否则视图
+平移/缩放后距离全错。
+2026-11-17 统稿（用户 22:30 令一次做好再发）：①字号统一——长度标记、节点编号
+标签、连接器真名标签全部同一字号（屏幕恒定 11px），三种标签放大到 1.5 倍后才
+显示（全图时 110 个标签按可读尺寸会糊成一片）；新增真名标签（连接器 22 个 +
+扎带 39 个有真名的，编号下方一行；只有 Body 编号的不加；扎带名去 "Copy (n) of "
+复制标记，弹窗仍显全名）；名称标签紧贴各自圆点（右缘 + 3px，屏幕恒定），不许错
+位到别的点旁边；②长度标签按画出折线的弧长中点定位（_midpoint_perp
+沿折线走一半长度，不按端点连线中点；折线管/多段管已实测核对）；③平行管弹窗：
+被保留的平行段点开后另列被隐藏那根平行管的长度/直径（parallel_hidden /
+hidden_segs），注明“平行管”。
+2026-11-17 v6p2 过路点合并 + 自环符号 + 标签下拉（用户 22:44/22:49/22:51/22:52 令）：
+只连两个地方的点就是过路点，合并（17 个 N + BN01 + BN04，共 19 处，节点 110→91，
+路径 108→91；段级合并，同根管子先配，剩下的一对配一起；BN04–N04 成链成
+CLP01→CLP11，Body.113 的 SEG02 另成 CLP01→CLP23）；合并路径的 key 为组成管子以
++ 连接，弹窗列出每根组成管子（编号、直径、长度、段），搜组成管子编号也能定位
+到合并路径（Body.113 本身仍有独立路径，不走别名）；自环 3 处改画小环符号（屏幕
+恒定半径 8px，圆心距节点 20px，方向取最大无管空角）；标签下拉菜单四开关默认全
+开；全部管子统一深蓝 #2c5f8a，红色不许再用在管子上。单根分支行为一律不动。
 """
 import json, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +41,12 @@ from unfold_2d_v3 import (seg_proper_intersect, seg_collinear_overlap,
 TYPE_CN = {'connector': '连接器', 'clamp': '卡扣', 'fork': '分支点', 'joint': '接头'}
 TYPE_COL = {'connector': '#e03131', 'clamp': '#2f9e44', 'fork': '#f08c00', 'joint': '#868e96'}
 
+import re as _re
+_COPY_PREFIX = _re.compile(r'^(Copy \(\d+\) of )+')
+def _label_name(s):
+    """图面标签用名：去掉 CATIA 复制标记 "Copy (n) of " 前缀（复制标记不是名字本身），其余照实。弹窗仍显示完整 3D 全名。"""
+    return _COPY_PREFIX.sub('', s)
+
 def main():
     lj_path, out_path = sys.argv[1], sys.argv[2]
     d = json.load(open(lj_path, encoding='utf-8'))
@@ -24,7 +55,6 @@ def main():
     bends, warnings = d['bends'], d['warnings']
     version = d.get('meta', {}).get('version', 'v3')
     trunk_path = d.get('meta', {}).get('trunk_path')  # v5：主干路径（旧版无则不显示）
-    trunk_keys = set(trunk_path['branch_list']) if trunk_path else set()
     from datetime import date as _date
     today = _date.today().isoformat()
     xmin, ymin, xmax, ymax = stats['bbox']
@@ -37,29 +67,100 @@ def main():
     def Y(y):
         return -y
 
+    def _midpoint_perp(pts):
+        """折线按弧长的中点 + 该处单位法向（SVG 坐标，取屏幕上方一侧）。
+        返回 (mx, my_svg, px, py)：中点与法向，供长度标签定位。"""
+        import math
+        total = 0.0
+        seg_lens = []
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            L = math.hypot(x2 - x1, y2 - y1)
+            seg_lens.append(L)
+            total += L
+        half, acc = total / 2, 0.0
+        for (x1, y1), (x2, y2), L in zip(pts, pts[1:], seg_lens):
+            if L > 0 and acc + L >= half:
+                t = (half - acc) / L
+                mx = x1 + (x2 - x1) * t
+                my = y1 + (y2 - y1) * t
+                dx, dy = (x2 - x1) / L, (y2 - y1) / L  # 布局坐标系方向
+                # SVG 坐标 y 翻转：法向候选 (dy, dx) 与 (-dy, -dx)，取屏幕上方（SVG y 更小）
+                px, py = dy, dx
+                if py > 0 or (py == 0 and px < 0):
+                    px, py = -px, -py
+                return mx, -my, px, py
+            acc += L
+        mx, my = pts[len(pts) // 2]
+        return mx, -my, 0.0, -1.0
+
     # ---- 静态 SVG 内容（Python 生成，便于离线核对元素数） ----
     parts = []
-    # 管子折线（v5：主干路径分支画红色加粗，一眼可见整条主干是否拉直）
+    nodes_by_code = {n['code']: n for n in nodes}
+    # 管子折线（v6p2：用户 22:51 定，全部管子统一深蓝 #2c5f8a，不用红，
+    # 主干/分支颜色区分取消；线宽统一由 applyView 按屏幕像素定）
     for b in branches:
         pts = ' '.join(f"{x:.2f},{Y(y):.2f}" for x, y in b['points'])
-        if b['key'] in trunk_keys:
-            stroke, sw = '#d62728', '2.6'
+        stroke, sw = '#2c5f8a', '1.6'
+        # v6p2：合并路径的 title 列组成管子（直径可能不同，不写单一 Φ）
+        if b.get('merged_from'):
+            title = b['key'] + ' L=' + str(b['len_3d']) + '（' + ' + '.join(
+                f"{m['key']} Φ{m['dia']}" for m in b['merged_from']) + '）'
         else:
-            stroke, sw = '#2c5f8a', '1.6'
+            title = f"{b['key']} Φ{b['dia']} L={b['len_3d']}"
         parts.append(
             f'<polyline class="tube" data-key="{b["key"]}" points="{pts}" '
             f'fill="none" stroke="{stroke}" stroke-width="{sw}" stroke-linejoin="round" '
-            f'stroke-linecap="round"><title>{b["key"]} Φ{b["dia"]} L={b["len_3d"]}</title></polyline>')
-    # 节点圆 + 编号
+            f'stroke-linecap="round"><title>{title}</title></polyline>')
+        # 长度标签（2026-11-17 用户要求）：3D 弧长四舍五入取整，居中放中点上方，不压线；
+        # 字号/位置由 applyView 按视图定（放大后显示），data-* 存中点与法向
+        if len(b['points']) >= 2:
+            mx, my, px, py = _midpoint_perp(b['points'])
+            lab = int(b['len_3d'] + 0.5)
+            # v6p2：纯自环分支（Body.96）折线退化为一点，长度标签沿环方向外放
+            # data-loff-dir 为布局坐标系角度（y 朝上），applyView 换算到 SVG 坐标系
+            loff = ''
+            if b.get('label_offset'):
+                loff = (f' data-loff-dir="{b["label_offset"]["dir_deg"]}" '
+                        f'data-loff-dist="{b["label_offset"]["dist_px"]}"')
+            parts.append(
+                f'<text class="lenlbl" data-key="{b["key"]}" data-mx="{mx:.2f}" data-my="{my:.2f}" '
+                f'data-px="{px:.3f}" data-py="{py:.3f}"{loff} x="{mx:.2f}" y="{my:.2f}">{lab}</text>')
+    # 自环符号（v6p2：BN02 两处 + BN03 一处，改画统一小环；位置/大小由 applyView
+    # 按屏幕恒定值定：半径 8px，圆心距节点 20px；data-dir 为布局坐标系角度，
+    # applyView 换算到 SVG 坐标系（y 朝下，取负角）；点小环弹出对应管子详情）
+    for b in branches:
+        for lp in b.get('loop', []):
+            nn = nodes_by_code[lp['node']]
+            parts.append(
+                f'<circle class="loopring" data-key="{b["key"]}" data-node="{lp["node"]}" '
+                f'data-dir="{lp["dir_deg"]}" data-seg="{lp["seg"]}" '
+                f'cx="{nn["x"]:.2f}" cy="{Y(nn["y"]):.2f}" r="8" fill="none" '
+                f'stroke="#2c5f8a" stroke-width="3">'
+                f'<title>自环 {lp["branch"]} {lp["seg"]} {lp["length_mm"]}mm</title></circle>')
+    # 节点圆 + 编号（终端节点连接器/卡扣圆点画大：静态 r=12，applyView 按类型
+    # 覆写为屏幕恒定 12px；分支点/接头 r=6。2026-11-17 用户真机反馈终端节点点太小点不到）
+    import html as _html
     for n in nodes:
         c = TYPE_COL.get(n['type'], '#000')
+        term = n['type'] in ('connector', 'clamp')
+        r_dot = '12' if term else '6'
+        r_hit = '40' if term else '30'
+        # 真名标签（2026-11-17 统稿 + 用户补充令）：连接器（22 个）与扎带（39 个）
+        # 有真名的都加，放在编号标签下方一行；只有 Body 编号的（连接器 10 个、
+        # 扎带 2 个）不编造、不加。data-nx/data-ny 存节点中心（SVG 坐标），applyView
+        # 据此把标签紧贴在各自圆点旁边（右缘 + 3px），不许错位到别的点旁边。
+        nm = ''
+        if term and n.get('name_3d') and not n['name_3d'].startswith('Body.'):
+            disp = _label_name(n['name_3d'])
+            nm = (f'<text class="nmlbl" data-nx="{n["x"]:.2f}" data-ny="{Y(n["y"]):.2f}" '
+                  f'x="{n["x"] + 6:.2f}" y="{Y(n["y"]) + 3:.2f}" fill="{c}">{_html.escape(disp)}</text>')
         parts.append(
             f'<g class="node" data-code="{n["code"]}">'
-            f'<circle class="ndot" cx="{n["x"]:.2f}" cy="{Y(n["y"]):.2f}" r="4.2" fill="{c}" '
+            f'<circle class="ndot" cx="{n["x"]:.2f}" cy="{Y(n["y"]):.2f}" r="{r_dot}" fill="{c}" '
             f'stroke="#fff" stroke-width="1.2"/>'
-            f'<circle class="nhit" cx="{n["x"]:.2f}" cy="{Y(n["y"]):.2f}" r="12" fill="transparent"/>'
-            f'<text class="lbl" x="{n["x"] + 6:.2f}" y="{Y(n["y"]) + 3:.2f}" fill="{c}">{n["code"]}</text>'
-            f'</g>')
+            f'<circle class="nhit" cx="{n["x"]:.2f}" cy="{Y(n["y"]):.2f}" r="{r_hit}" fill="transparent"/>'
+            f'<text class="lbl" data-nx="{n["x"]:.2f}" data-ny="{Y(n["y"]):.2f}" x="{n["x"] + 6:.2f}" y="{Y(n["y"]) + 3:.2f}" fill="{c}">{n["code"]}</text>'
+            f'{nm}</g>')
     # X 交叉点标记（v4 新增：红色 ✕，臂长 ±5mm；title 显示相交的两根分支）
     for x in d.get('crossings', []):
         cx, cy = x['x'], Y(x['y'])
@@ -161,7 +262,26 @@ def main():
             f'总长 <b>{trunk_path["length_mm"]} mm</b> · '
             f'<b>{trunk_path["branches"]} 根分支</b> · {trunk_path["joints"]} 个关节 · '
             f'直线跨度 {trunk_path["span_mm"]} mm</div>')
-    legend_trunk = ('<span style="display:inline-block;width:16px;height:0;border-top:3px solid #d62728;margin-right:5px;vertical-align:middle"></span>主干路径<br>' if trunk_path else '')
+    # v6p2：主干/分支颜色区分取消，图例里红主干行删掉；接头节点已全并掉，
+    # 接头图例项只在还有接头节点时显示；自环符号加一行说明
+    joint_item = ('<i style="background:#868e96"></i>接头 ' if any(
+        n['type'] == 'joint' for n in nodes) else '')
+    n_loop = stats.get('loop_symbols', 0)
+    loop_note = (f'<br><span style="color:#2c5f8a;font-weight:700">○</span> 自环符号（{n_loop} 处，不按比例）' if n_loop else '')
+    # 平行管说明（v6p1：平行对只画一根，被隐藏的段数来自 stats，不硬编码）
+    n_hp = stats.get('hidden_parallel_segs', 0)
+    hidden_note = (f'<br><span style="color:#868e96">平行管 {n_hp} 段未单画，点保留的管子看详情</span>' if n_hp else '')
+    # v6p2：过路点合并说明 + 顶部统计行（“分支”数是已画路径数，另标管子总数，
+    # 避免误读为丢管子；无合并的旧版 layout.json 走原格式）
+    n_mj = stats.get('merged_nodes', stats.get('merged_joints', 0))
+    merged_note = (f'<br><span style="color:#868e96">过路点合并 {n_mj} 处，点合并的管子看各根详情</span>' if n_mj else '')
+    if n_mj:
+        stats_line = (f"路径 <b>{stats['branches_placed']}</b>（{stats['branches_total']} 根管子，"
+                      f"{n_mj} 处过路点合并） · 节点 <b>{stats['nodes_placed']}/{stats['nodes_total']}</b> · "
+                      f"线段 <b>{n_seg}</b> · 展开总长 <b>{total_len:.1f} mm</b> · 图纸 <b>{w_mm} × {h_mm} mm</b>")
+    else:
+        stats_line = (f"分支 <b>{stats['branches_placed']}/{stats['branches_total']}</b> · 节点 <b>{stats['nodes_placed']}/{stats['nodes_total']}</b> · "
+                      f"线段 <b>{n_seg}</b> · 展开总长 <b>{total_len:.1f} mm</b> · 图纸 <b>{w_mm} × {h_mm} mm</b>")
 
     html_doc = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -180,14 +300,23 @@ header h1 {{ font-size: 16px; font-weight: 600; }}
 .bar input {{ flex: 1 1 140px; padding: 6px 8px; font-size: 14px; border: none; border-radius: 4px; }}
 .bar button {{ padding: 6px 10px; font-size: 13px; border: none; border-radius: 4px; background: #2c5f8a; color: #fff; cursor: pointer; }}
 .bar button:active {{ background: #1f4566; }}
+.dd {{ position: relative; }}
+.dd-panel {{ position: absolute; top: calc(100% + 4px); left: 0; background: #fff; border: 1px solid #adb5bd; border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: 4px 0; display: none; z-index: 10; min-width: 140px; }}
+.dd-panel.open {{ display: block; }}
+.dd-panel label {{ display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 14px; color: #212529; cursor: pointer; min-height: 44px; }}
+.dd-panel input {{ width: 18px; height: 18px; flex: none; }}
 #wrap {{ flex: 1; position: relative; overflow: hidden; background: #fff; }}
 #svg {{ width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }}
 #svg.dragging {{ cursor: grabbing; }}
 .tube {{ cursor: pointer; }}
-.tube.sel {{ stroke: #f08c00 !important; stroke-width: 3.2 !important; }}
-.node.sel .ndot {{ stroke: #f08c00; stroke-width: 3; }}
+.tube.sel {{ stroke: #f08c00 !important; }}
+.loopring {{ cursor: pointer; }}
+.loopring.sel {{ stroke: #f08c00 !important; }}
+.node.sel .ndot {{ stroke: #f08c00; }}
 .node.hl .ndot {{ stroke: #ffd43b; stroke-width: 3; }}
 .lbl {{ font-size: 14px; font-weight: 600; pointer-events: none; user-select: none; paint-order: stroke; stroke: rgba(255,255,255,.9); }}
+.nmlbl {{ font-weight: 600; pointer-events: none; user-select: none; paint-order: stroke; stroke: rgba(255,255,255,.9); }}
+.lenlbl {{ font-weight: 600; fill: #495057; pointer-events: none; user-select: none; paint-order: stroke; stroke: rgba(255,255,255,.95); text-anchor: middle; }}
 .legend {{ position: absolute; left: 8px; bottom: 8px; bottom: calc(8px + env(safe-area-inset-bottom, 0px)); background: rgba(255,255,255,.92); border: 1px solid #dee2e6; border-radius: 6px; padding: 6px 9px; font-size: 12px; line-height: 1.7; color: #495057; z-index: 4; }}
 #legendToggle {{ display: none; border: none; background: none; font-size: 13px; color: #495057; cursor: pointer; padding: 2px 4px; }}
 .legend i {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }}
@@ -220,7 +349,7 @@ header h1 {{ font-size: 16px; font-weight: 600; }}
 <body>
 <header>
 <h1>仪表线束（IP-Harness）2D 展开图 · {version}</h1>
-<div class="stats">分支 <b>{stats['branches_placed']}/{stats['branches_total']}</b> · 节点 <b>{stats['nodes_placed']}/{stats['nodes_total']}</b> · 线段 <b>{n_seg}</b> · 展开总长 <b>{total_len:.1f} mm</b> · 图纸 <b>{w_mm} × {h_mm} mm</b></div>
+<div class="stats">{stats_line}</div>
 {trunk_header}
 {ck_header}
 <div class="bar">
@@ -228,6 +357,15 @@ header h1 {{ font-size: 16px; font-weight: 600; }}
 <button id="btnSearch">定位</button>
 <button id="btnFit">全图</button>
 <button id="btnClear">清除</button>
+<div class="dd" id="labelDD">
+<button id="btnLabels" type="button">标签 4/4 ▾</button>
+<div class="dd-panel" id="labelPanel">
+<label><input type="checkbox" data-lbl="conn" checked> 连接器名</label>
+<label><input type="checkbox" data-lbl="clamp" checked> 扎带名</label>
+<label><input type="checkbox" data-lbl="node" checked> 节点名</label>
+<label><input type="checkbox" data-lbl="len" checked> 长度</label>
+</div>
+</div>
 </div>
 </header>
 <div id="wrap">
@@ -236,7 +374,7 @@ header h1 {{ font-size: 16px; font-weight: 600; }}
 {svg_inner}
 </g>
 </svg>
-<div class="legend" id="legend"><button id="legendToggle" type="button">图例 ▸</button><div class="legend-body">{legend_trunk}<span class="ln"></span>管子（分支）<br><i style="background:#e03131"></i>连接器 <i style="background:#2f9e44"></i>卡扣 <i style="background:#f08c00"></i>分支点 <i style="background:#868e96"></i>接头<br><span style="color:#e03131;font-weight:700">✕</span> X 交叉点</div></div>
+<div class="legend" id="legend"><button id="legendToggle" type="button">图例 ▸</button><div class="legend-body"><span class="ln"></span>管子（分支）<br><i style="background:#e03131"></i>连接器 <i style="background:#2f9e44"></i>卡扣 <i style="background:#f08c00"></i>分支点 {joint_item}<br><span style="color:#e03131;font-weight:700">✕</span> X 交叉点{loop_note}<br><span style="color:#868e96">放大后显示编号、名称与长度（mm）</span>{hidden_note}{merged_note}</div></div>
 <div id="verify">拐弯 {stats['bends']} 次 · 残留干涉 {stats['residual_interference_pairs']} 对<br>（X 交叉 {n_x} 对 · 间距&lt;5mm {n_near} 对 · 压着画 {n_ov} 对）<br>最大长度误差 {stats['max_len_err_mm']} mm · 无真实几何环{ck_verify}</div>
 <div id="popup"><button class="x" id="btnClose">×</button><div id="popBody"></div></div>
 <div id="toast"></div>
@@ -253,6 +391,13 @@ var nodesByCode = {{}};
 DATA.nodes.forEach(function(n) {{ nodesByCode[n.code] = n; }});
 var branchesByKey = {{}};
 DATA.branches.forEach(function(b) {{ branchesByKey[b.key] = b; }});
+// v6p2：合并路径的组成管子编号也指向合并路径，搜 Body.78 能找到它所在的合并管子；
+// 但组成编号本身已有独立路径时不覆盖（如 Body.113：SEG02 另成一条线，搜它应定位到那条线）
+DATA.branches.forEach(function(b) {{
+  (b.merged_from || []).forEach(function(m) {{ if (!(m.key in branchesByKey)) branchesByKey[m.key] = b; }});
+}});
+// v6p2：标签下拉菜单四开关，默认全开（applyView 按此决定三类标签显隐）
+var labelVis = {{ conn: true, clamp: true, node: true, len: true }};
 var trunkIdx = {{}};
 if (DATA.trunk_path && DATA.trunk_path.branch_list) {{
   DATA.trunk_path.branch_list.forEach(function(k, i) {{ trunkIdx[k] = i + 1; }});
@@ -262,16 +407,107 @@ if (DATA.trunk_path && DATA.trunk_path.branch_list) {{
 var view = {{ x: 0, y: 0, k: 1 }};
 function applyView() {{
   vp.setAttribute('transform', 'translate(' + view.x + ',' + view.y + ') scale(' + view.k + ')');
-  // 标签：基础 14（mm 单位），随放大适度变大（√k，上限 2 倍），放大后可读；白晕描边提可读性
-  var grow = Math.min(2, Math.sqrt(view.k));
-  var fs = 14 * grow / view.k;
-  var sw = 1.6 / view.k;
+  // SVG 单位→屏幕像素的总缩放 = viewBox→屏幕 base 比例 × view.k
+  // （注意：旧公式 r=5/k 漏乘 base 比例，手机全图时圆点实际只有约 1.5px，
+  //  2026-11-17 22:18 核实；必须除以总缩放才是真正的屏幕恒定尺寸）
+  var baseScale = svg.getBoundingClientRect().width / svg.viewBox.baseVal.width;
+  var scale = baseScale * view.k;
+  // 标签字号统一（2026-11-17 用户要求：长度标记、节点编号、真名标签全部同一字号）：
+  // 三种标签一律屏幕恒定 11px；k<1.5 时全图 110 个标签按可读尺寸会糊成一片，
+  // 故放大到 1.5 倍后才显示（全图时它们只有约 2px，本来也看不清）
+  var showLbl = view.k >= 1.5;
+  var lblFs = 11 / scale, lblSw = 2.5 / scale, lblGap = 13 / scale;
+  // 节点圆点：终端节点（连接器/卡扣）屏幕半径 12px，手指可点；分支点/接头 6px
+  // （2026-11-17 用户真机反馈：终端节点点太小点不到，原实际约 1.5px）
   var dots = document.querySelectorAll('.ndot');
-  for (var i = 0; i < dots.length; i++) {{ dots[i].setAttribute('r', 5.0 / view.k); dots[i].setAttribute('stroke-width', 1.2 / view.k); }}
+  for (var i = 0; i < dots.length; i++) {{
+    var nt = nodesByCode[dots[i].parentNode.getAttribute('data-code')];
+    var r = (nt && (nt.type === 'connector' || nt.type === 'clamp')) ? 12.0 : 6.0;
+    dots[i].setAttribute('r', r / scale);
+    // 选中描边屏幕 3px，未选中 1.2px（CSS 只定颜色，宽度这里定，避免单位制混淆）
+    var ring = dots[i].parentNode.classList.contains('sel') ? 3.0 : 1.2;
+    dots[i].setAttribute('stroke-width', ring / scale);
+  }}
+  // 点按热区：终端节点屏幕约 18px 半径，其余约 12px
+  var hits = document.querySelectorAll('.nhit');
+  for (var h = 0; h < hits.length; h++) {{
+    var ht = nodesByCode[hits[h].parentNode.getAttribute('data-code')];
+    var hr = (ht && (ht.type === 'connector' || ht.type === 'clamp')) ? 18 : 12;
+    hits[h].setAttribute('r', hr / scale);
+  }}
+  // 编号标签：紧贴各自圆点——x = 圆点右缘 + 3px（屏幕），y = 圆心 + 4px（基线略低于圆心），
+  // 位置按圆点半径动态算，不许错位到别的点旁边（2026-11-17 用户补充令）
   var lbls = document.querySelectorAll('.lbl');
-  for (var j = 0; j < lbls.length; j++) {{ lbls[j].style.fontSize = fs + 'px'; lbls[j].style.strokeWidth = (2.5 * grow / view.k) + 'px'; }}
+  for (var j = 0; j < lbls.length; j++) {{
+    var lb = lbls[j];
+    var showLb = showLbl && labelVis.node;
+    lb.style.display = showLb ? '' : 'none';
+    if (!showLb) continue;
+    var nt = nodesByCode[lb.parentNode.getAttribute('data-code')];
+    var dr = (nt && (nt.type === 'connector' || nt.type === 'clamp')) ? 12 : 6;
+    lb.setAttribute('x', parseFloat(lb.getAttribute('data-nx')) + (dr + 3) / scale);
+    lb.setAttribute('y', parseFloat(lb.getAttribute('data-ny')) + 4 / scale);
+    lb.style.fontSize = lblFs + 'px';
+    lb.style.strokeWidth = lblSw + 'px';
+  }}
+  // 真名标签：与编号标签同一字号、同一 x，y 在编号标签下方一行（13px 屏幕行距）
+  var nmlbls = document.querySelectorAll('.nmlbl');
+  for (var nm = 0; nm < nmlbls.length; nm++) {{
+    var nel = nmlbls[nm];
+    var nt2 = nodesByCode[nel.parentNode.getAttribute('data-code')];
+    var showNm = showLbl && (nt2 && nt2.type === 'connector' ? labelVis.conn : labelVis.clamp);
+    nel.style.display = showNm ? '' : 'none';
+    if (!showNm) continue;
+    var dr2 = (nt2 && (nt2.type === 'connector' || nt2.type === 'clamp')) ? 12 : 6;
+    nel.setAttribute('x', parseFloat(nel.getAttribute('data-nx')) + (dr2 + 3) / scale);
+    nel.setAttribute('y', parseFloat(nel.getAttribute('data-ny')) + 4 / scale + lblGap);
+    nel.style.fontSize = lblFs + 'px';
+    nel.style.strokeWidth = lblSw + 'px';
+  }}
   var tubes = document.querySelectorAll('.tube');
-  for (var t = 0; t < tubes.length; t++) {{ if (!tubes[t].classList.contains('sel')) tubes[t].setAttribute('stroke-width', sw); }}
+  for (var t = 0; t < tubes.length; t++) {{
+    // 线粗统一 8px（= 终端节点直径 24px 的 1/3，与圆点尺寸协调；不按直径/主干分层级，
+    // 2026-11-17 用户要求：线粗统一，不要有的大有的小）；选中时 12px
+    var wpx = tubes[t].classList.contains('sel') ? 12 : 8;
+    tubes[t].setAttribute('stroke-width', wpx / scale);
+  }}
+  // 长度标签：与编号/真名标签同一字号（屏幕 11px），居中放在弧长中点上方 10px 处，不压线
+  var lenOff = 10 / scale, lenSw = 3 / scale;
+  var lenlbls = document.querySelectorAll('.lenlbl');
+  for (var q = 0; q < lenlbls.length; q++) {{
+    var el = lenlbls[q];
+    var showLn = showLbl && labelVis.len;
+    el.style.display = showLn ? '' : 'none';
+    if (!showLn) continue;
+    var mx = parseFloat(el.getAttribute('data-mx')), my = parseFloat(el.getAttribute('data-my'));
+    var px = parseFloat(el.getAttribute('data-px')), py = parseFloat(el.getAttribute('data-py'));
+    var lx = mx + px * lenOff, ly = my + py * lenOff;
+    // v6p2：纯自环分支（Body.96）长度标签沿环方向外放（data-loff-dir 为布局坐标系角度，取负角换算到 SVG）
+    var loffDir = el.getAttribute('data-loff-dir');
+    if (loffDir !== null) {{
+      var la = -parseFloat(loffDir) * Math.PI / 180;
+      var ld = parseFloat(el.getAttribute('data-loff-dist')) / scale;
+      lx += Math.cos(la) * ld;
+      ly += Math.sin(la) * ld;
+    }}
+    el.setAttribute('x', lx);
+    el.setAttribute('y', ly);
+    el.style.fontSize = lblFs + 'px';
+    el.style.strokeWidth = lenSw + 'px';
+  }}
+  // 自环符号（v6p2）：屏幕恒定半径 8px，圆心距节点 30px；data-dir 为布局坐标系角度（y 朝上），SVG 坐标系 y 朝下故取负角；选中时线宽 5px
+  // （环距 30px 而非 20px：20px 时与 BN02 旁主干短管的长度标签重合——Body.71/Body.74 的标签距节点约 18px，2026-11-17 实测；30px 实测无重叠）
+  var rings = document.querySelectorAll('.loopring');
+  for (var rg = 0; rg < rings.length; rg++) {{
+    var ring = rings[rg];
+    var rn = nodesByCode[ring.getAttribute('data-node')];
+    if (!rn) continue;
+    var ra = -parseFloat(ring.getAttribute('data-dir')) * Math.PI / 180;
+    ring.setAttribute('cx', rn.x + Math.cos(ra) * 30 / scale);
+    ring.setAttribute('cy', -rn.y + Math.sin(ra) * 30 / scale);
+    ring.setAttribute('r', 8 / scale);
+    ring.setAttribute('stroke-width', (ring.classList.contains('sel') ? 5 : 3) / scale);
+  }}
   var xlines = document.querySelectorAll('.xline');
   for (var m = 0; m < xlines.length; m++) {{ xlines[m].setAttribute('stroke-width', (2.0 / view.k)); }}
 }}
@@ -293,7 +529,10 @@ function centerOn(x, y, k) {{
   if (k) view.k = k;
   applyView();
   var r = svg.getBoundingClientRect();
-  var pt = svg.createSVGPoint(); pt.x = r.width / 2; pt.y = r.height / 2;
+  // 注意：getScreenCTM() 的逆变换要的是屏幕（client）坐标，必须加 r.left/r.top；
+  // 旧版只用 r.width/2、r.height/2（元素相对坐标），目标会落在 header 下方被遮住
+  // （2026-11-17 实测：BN02 应在 SVG 中心 y=521，实际落在 y=259）
+  var pt = svg.createSVGPoint(); pt.x = r.left + r.width / 2; pt.y = r.top + r.height / 2;
   var c = pt.matrixTransform(svg.getScreenCTM().inverse());
   // c 为屏幕中心对应的 viewBox 点；要让图上点 (x,y) 落到屏幕中心：
   // x*k + t = c，故 t = c - x*k（直接赋值，一步到位）
@@ -342,7 +581,8 @@ svg.addEventListener('pointermove', function(e) {{
     moved = true;
   }} else if (dragging) {{
     var dx = e.clientX - downX, dy = e.clientY - downY;
-    if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
+    // 位移容差 12px：真人手指点按有轻微抖动，6px 太严会被判成拖动（2026-11-17 用户真机反馈）
+    if (Math.abs(dx) + Math.abs(dy) > 12) moved = true;
     if (moved) {{
       var p0 = svgPoint(prev.x, prev.y);
       var p1 = svgPoint(e.clientX, e.clientY);
@@ -352,7 +592,8 @@ svg.addEventListener('pointermove', function(e) {{
   }}
 }});
 function endPointer(e) {{
-  var wasTap = dragging && !moved && (Date.now() - downT) < 400;
+  // 点按判定放宽到 700ms：真人慢点（>400ms）原先会被判成拖动而不弹窗（2026-11-17 用户真机反馈）
+  var wasTap = dragging && !moved && (Date.now() - downT) < 700;
   delete pointers[e.pointerId];
   if (Object.keys(pointers).length === 0) {{
     dragging = false;
@@ -373,6 +614,7 @@ svg.addEventListener('dblclick', function(e) {{ zoomAt(e.clientX, e.clientY, 1.6
 function clearSel() {{
   document.querySelectorAll('.sel').forEach(function(el) {{ el.classList.remove('sel'); }});
   document.querySelectorAll('.node.hl').forEach(function(el) {{ el.classList.remove('hl'); }});
+  applyView();  // 选中状态变了，线宽/描边跟着变
 }}
 function esc(s) {{ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }}
 function showNode(code) {{
@@ -381,49 +623,146 @@ function showNode(code) {{
   clearSel();
   var g = document.querySelector('.node[data-code="' + code + '"]');
   if (g) g.classList.add('sel');
-  var conns = DATA.node_branches[code] || [];
-  conns.forEach(function(k) {{
-    var pl = document.querySelector('.tube[data-key="' + k + '"]');
-    if (pl) pl.classList.add('sel');
-  }});
+  // 选中节点时相连的线不许变色：节点选中与线选中完全分开，只亮节点本身
+  // （2026-11-17 用户要求：选中什么就亮什么；旧版会把相连管子也标橙）
+  var conns = DATA.node_branches[code] || [];  // 只用于弹窗里列出连接管子，不再高亮
   var rows = '<tr><td class="k">类型</td><td>' + esc(TYPE_CN[n.type] || n.type) + '</td></tr>'
     + '<tr><td class="k">3D 全名</td><td class="mono">' + esc(n.name_3d || '（无实体名）') + '</td></tr>'
     + '<tr><td class="k">2D 坐标</td><td>(' + n.x.toFixed(1) + ', ' + n.y.toFixed(1) + ') mm</td></tr>'
     + '<tr><td class="k">连接管子</td><td class="mono">' + esc(conns.join(', ') || '—') + '</td></tr>';
   popBody.innerHTML = '<h2>' + esc(code) + ' · ' + esc(TYPE_CN[n.type] || n.type) + '</h2><table>' + rows + '</table>';
   popup.style.display = 'block';
+  applyView();  // 选中描边加粗
 }}
 function showBranch(key) {{
   var b = branchesByKey[key];
   if (!b) return;
   clearSel();
-  var pl = document.querySelector('.tube[data-key="' + key + '"]');
+  // v6p2：用解析后的 b.key 找管子元素（搜组成管子编号时 key 是组成编号，元素上是合并 key）
+  var pl = document.querySelector('.tube[data-key="' + b.key + '"]');
   if (pl) pl.classList.add('sel');
-  [b.node0, b.node1].forEach(function(c) {{
-    var g = document.querySelector('.node[data-code="' + c + '"]');
-    if (g) g.classList.add('hl');
-  }});
+  // v6p2：该管子有自环符号时小环一起亮（选中什么亮什么，小环是管子的一部分）
+  document.querySelectorAll('.loopring[data-key="' + b.key + '"]').forEach(function(rg) {{ rg.classList.add('sel'); }});
+  // 选中管子时端点节点不许高亮：只亮管子本身（同上，选中什么亮什么）
   var bs = DATA.bends.filter(function(x) {{ return x.branch === key; }});
   var bendTxt = bs.length ? bs.map(function(x) {{ return x.seg + ' @' + x.at + ' ' + (typeof x.delta === 'number' ? (x.delta > 0 ? '+' : '') + x.delta + '°' : x.delta) + '（' + x.note + '）'; }}).join('<br>') : '无';
   var segs = b.pieces.map(function(p) {{ return p.seg + ' ' + p.na + '→' + p.nb; }}).join('<br>');
+  // 平行管（v6p1：平行对只画一根，被隐藏那根的数据列在这里，不丢数据）
+  var parRows = '';
+  (b.parallel_hidden || []).forEach(function(h) {{
+    parRows += '<tr><td class="k">平行管</td><td class="mono">' + esc(h.hidden_branch) + ' Φ' + h.hidden_dia_mm + ' · ' + h.hidden_length_mm + ' mm（' + esc(h.pair) + (h.merged_via ? '，经 ' + esc(h.merged_via) + ' 合并' : '') + '，未单画）</td></tr>';
+  }});
+  (b.hidden_segs || []).forEach(function(h) {{
+    parRows += '<tr><td class="k">平行段</td><td class="mono">' + esc(h.seg) + ' ' + h.length_mm + ' mm · Φ' + h.dia_mm + '（与 ' + esc(h.kept_branch) + ' ' + esc(h.kept_seg) + ' 平行，未单画）</td></tr>';
+  }});
   var trunkRow = '';
-  if (trunkIdx[key]) {{
+  if (b.trunk_positions && b.trunk_positions.length) {{
+    // v6p2：合并的主干路径占连续多根，显示序号范围
+    var tps = b.trunk_positions.slice().sort(function(a, c) {{ return a - c; }});
+    var rng = tps.length > 1 ? ('第 ' + tps[0] + '–' + tps[tps.length - 1]) : ('第 ' + tps[0]);
+    trunkRow = '<tr><td class="k">主干路径</td><td>是 · ' + rng + ' / ' + DATA.trunk_path.branches + ' 根</td></tr>';
+  }} else if (trunkIdx[key]) {{
     trunkRow = '<tr><td class="k">主干路径</td><td>是 · 第 ' + trunkIdx[key] + ' / ' + DATA.trunk_path.branches + ' 根</td></tr>';
   }}
-  var rows = trunkRow + '<tr><td class="k">直径</td><td>Φ' + b.dia + ' mm</td></tr>'
+  // v6p2：合并路径列出每根组成管子（编号、直径、长度、段），直径不同时也分开列，不丢数据；
+  // 部分管子（Body.113 的 SEG01 在链里、SEG02 另成线）标“（部分）”
+  var diaRows = '';
+  if (b.merged_from && b.merged_from.length) {{
+    diaRows = b.merged_from.map(function(m) {{
+      var sg = (m.segs && m.segs.length) ? ' · ' + m.segs.join('+') : '';
+      var pt = m.partial ? '（部分）' : '';
+      return '<tr><td class="k">组成管子</td><td class="mono">' + esc(m.key) + pt + ' · Φ' + m.dia + ' · ' + m.len_3d + ' mm' + sg + '</td></tr>';
+    }}).join('');
+  }} else {{
+    diaRows = '<tr><td class="k">直径</td><td>Φ' + b.dia + ' mm</td></tr>';
+  }}
+  // v6p2：单根但被拆开的管子（Body.113 余段），说明另一部分在哪
+  var partialRow = '';
+  if (b.partial) {{
+    partialRow = '<tr><td class="k">部分管段</td><td>本管仅含 ' + esc(b.partial.segs_here.join('+')) + '（' + b.len_3d + ' mm）；其余段在 ' + esc(b.partial.other_paths.join('、')) + ' 中（整管 ' + b.partial.total_len_3d + ' mm）</td></tr>';
+  }}
+  // v6p2：自环说明（图上画为小环符号，不按比例，真值在此）
+  var loopRows = '';
+  (b.loop || []).forEach(function(lp) {{
+    loopRows += '<tr><td class="k">自环</td><td class="mono">' + esc(lp.seg) + ' ' + lp.length_mm + ' mm · Φ' + lp.dia_mm + '（图上画为小环符号，不按比例）</td></tr>';
+  }});
+  var rows = trunkRow + diaRows + partialRow
     + '<tr><td class="k">3D 弧长</td><td>' + b.len_3d + ' mm</td></tr>'
     + '<tr><td class="k">2D 长度</td><td>' + b.len_2d + ' mm</td></tr>'
     + '<tr><td class="k">端点</td><td class="mono">' + esc(b.node0) + ' → ' + esc(b.node1) + '</td></tr>'
-    + '<tr><td class="k">线段</td><td class="mono">' + segs + '</td></tr>'
+    + '<tr><td class="k">线段</td><td class="mono">' + segs + '</td></tr>' + parRows + loopRows
     + '<tr><td class="k">拐弯</td><td>' + bendTxt + '</td></tr>';
-  popBody.innerHTML = '<h2>管子 ' + esc(key) + '</h2><table>' + rows + '</table>';
+  popBody.innerHTML = '<h2>管子 ' + esc(b.key) + '</h2><table>' + rows + '</table>';
   popup.style.display = 'block';
+  applyView();  // 选中线加粗
+}}
+// 点按命中辅助：屏幕坐标 (cx,cy) 到最近节点的距离（像素），返回 {{code, d}}，无节点则 null
+function nearestNodeDist(cx, cy) {{
+  var best = null, bd = Infinity;
+  var dots = document.querySelectorAll('.node .ndot');
+  for (var i = 0; i < dots.length; i++) {{
+    var r = dots[i].getBoundingClientRect();
+    var d = Math.hypot(cx - (r.left + r.width / 2), cy - (r.top + r.height / 2));
+    if (d < bd) {{ bd = d; best = dots[i].parentNode.getAttribute('data-code'); }}
+  }}
+  return best ? {{ code: best, d: bd }} : null;
+}}
+function distToSeg(px, py, x1, y1, x2, y2) {{
+  var dx = x2 - x1, dy = y2 - y1;
+  var len2 = dx * dx + dy * dy;
+  var t = len2 ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len2)) : 0;
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}}
+// 屏幕坐标到最近管子的距离（像素，点到折线段最短距离），返回 {{key, d}}，无则 null
+function nearestTubeDist(cx, cy) {{
+  var p = svgPoint(cx, cy);
+  // 注意：svgPoint 得出的是 viewBox 坐标，须先逆变换到 vp 局部坐标（管子折线点
+  // 的坐标系），否则视图平移/缩放后距离全错（2026-11-17 实测：平移后中点距管子 70px）
+  var px = (p.x - view.x) / view.k, py = (p.y - view.y) / view.k;
+  var scale = svg.getBoundingClientRect().width / svg.viewBox.baseVal.width * view.k;
+  var best = null, bd = Infinity;
+  var tubes = document.querySelectorAll('.tube');
+  for (var i = 0; i < tubes.length; i++) {{
+    var pts = tubes[i].points;
+    for (var j = 0; j + 1 < pts.numberOfItems; j++) {{
+      var a = pts.getItem(j), b = pts.getItem(j + 1);
+      var d = distToSeg(px, py, a.x, a.y, b.x, b.y) * scale;
+      if (d < bd) {{ bd = d; best = tubes[i].getAttribute('data-key'); }}
+    }}
+  }}
+  return best ? {{ key: best, d: bd }} : null;
+}}
+// 屏幕坐标到最近自环符号圆心的距离（像素），返回 {{key, d}}，无则 null
+function nearestRingDist(cx, cy) {{
+  var best = null, bd = Infinity;
+  var rings = document.querySelectorAll('.loopring');
+  for (var i = 0; i < rings.length; i++) {{
+    var r = rings[i].getBoundingClientRect();
+    var d = Math.hypot(cx - (r.left + r.width / 2), cy - (r.top + r.height / 2));
+    if (d < bd) {{ bd = d; best = rings[i].getAttribute('data-key'); }}
+  }}
+  return best ? {{ key: best, d: bd }} : null;
 }}
 function handleTap(e) {{
-  var t = e.target;
-  var ng = t.closest ? t.closest('.node') : null;
-  if (ng) {{ showNode(ng.getAttribute('data-code')); return; }}
-  if (t.classList && t.classList.contains('tube')) {{ showBranch(t.getAttribute('data-key')); return; }}
+  // 注意：pointerdown 里 svg.setPointerCapture 会把 pointerup 的 e.target
+  // 重定向到 svg 本身，故不能用 e.target / elementFromPoint 判断点中了什么，
+  // 改按坐标算距离命中（2026-11-17 实测：未修前点任意节点 e.target 恒为 svg）。
+  // 优先级按距离取最近：落点到节点中心与到管子折线谁近选谁，节点不再无条件
+  // 优先——否则点在线中部也会弹连接器（2026-11-17 用户真机反馈）。
+  var cx = e.clientX, cy = e.clientY;
+  var nd = nearestNodeDist(cx, cy);
+  var td = nearestTubeDist(cx, cy);
+  var rd = nearestRingDist(cx, cy);
+  // 容差：弹窗关闭时节点 24px / 管子 20px；弹窗已开时收紧（节点 12px / 管子 10px），
+  // 否则图上到处是节点/管子，点空白关不掉弹窗；小环与管子同容差
+  var open = popup.style.display === 'block';
+  var nodeTol = open ? 12 : 24, tubeTol = open ? 10 : 20;
+  var nodeOk = nd && nd.d <= nodeTol;
+  var tubeOk = td && td.d <= tubeTol;
+  var ringOk = rd && rd.d <= tubeTol;
+  if (nodeOk && (!tubeOk || nd.d <= td.d) && (!ringOk || nd.d <= rd.d)) {{ showNode(nd.code); return; }}
+  if (ringOk && (!tubeOk || rd.d <= td.d)) {{ showBranch(rd.key); return; }}
+  if (tubeOk) {{ showBranch(td.key); return; }}
   popup.style.display = 'none';
   clearSel();
 }}
@@ -468,6 +807,27 @@ document.getElementById('legendToggle').addEventListener('click', function() {{
   var lg = document.getElementById('legend');
   var open = lg.classList.toggle('open');
   this.textContent = open ? '图例 ▾' : '图例 ▸';
+}});
+// ---- 标签下拉菜单（v6p2：图面字太多显乱，四开关默认全开，点选即时生效，不重载；点面板外关闭） ----
+var labelBtn = document.getElementById('btnLabels');
+var labelPanel = document.getElementById('labelPanel');
+function updateLabelBtn() {{
+  var n = (labelVis.conn ? 1 : 0) + (labelVis.clamp ? 1 : 0) + (labelVis.node ? 1 : 0) + (labelVis.len ? 1 : 0);
+  labelBtn.textContent = '标签 ' + n + '/4 ▾';
+}}
+labelBtn.addEventListener('click', function(e) {{
+  e.stopPropagation();
+  labelPanel.classList.toggle('open');
+}});
+document.addEventListener('click', function(e) {{
+  if (!document.getElementById('labelDD').contains(e.target)) labelPanel.classList.remove('open');
+}});
+labelPanel.querySelectorAll('input[type="checkbox"]').forEach(function(cb) {{
+  cb.addEventListener('change', function() {{
+    labelVis[cb.getAttribute('data-lbl')] = cb.checked;
+    updateLabelBtn();
+    applyView();
+  }});
 }});
 // ---- 旧浏览器无 100dvh 时，用 visualViewport 实际高度定 body 高 ----
 if (!window.CSS || !CSS.supports('height', '100dvh')) {{

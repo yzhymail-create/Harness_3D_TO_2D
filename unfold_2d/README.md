@@ -4,8 +4,10 @@
 
 ## 文件
 
-- `需求说明.md`：最新需求（v6，见 §五主干路径定义、§十三正交规则与 §十四分支逐层最长路径规则；v5/v4 见 §十，v3 见 §一～§十二）。需求有更新就写进这里，附日期与变更记录。
-- `unfold_2d_v6.py`：当前主程序（v6）。§十四 逐层最长路径：段级生成树上逐层取最长简单路径为脊线、整条拉直垂直于上级脊线；两阶段分离（plan.json 方案先于放置）；硬规则 10 项（任一失败不出图）+ 清单自证；DXF 回读为交付前验证。IP 实测：X 交叉 0 对；H1 竖向居中 14.45% 由用户 2026-11-17 21:39 决定豁免通过（名义阈值仍 5%，清单带 exempt 标记），硬规则 10/10；DXF/Excel 已生成待验证，网页查看器已交付。
+- `需求说明.md`：最新需求（v6p2，见 §五主干路径定义、§十三正交规则、§十四分支逐层最长路径规则、§十五平行对只画一根与 §十六过路点合并与自环符号；v6p1/v6/v5/v4 见 §十，v3 见 §一～§十二）。需求有更新就写进这里，附日期与变更记录。
+- `merge_joints_v6p2.py`：当前主流程第二步（v6p2）。读 v6p1 的 layout.json 做后处理：§十六 过路点合并（IP：19 个点，13 条合并路径，路径 108→91、节点 110→91，几何不动）＋自环改小圆环（3 处，半径 8px、距节点 30px，不按 1:1，真值在弹窗）。输出合并后 layout.json + merge_report_v6p2.md。IP 实测：非自环长度最大误差 0.0mm，110 根管子全数可查。
+- `unfold_2d_v6p1.py`：当前主流程第一步（v6p1，布局生成）。v6 + §十五 平行对只画一根（4 对各留走主干/脊线那根，隐藏整根 Body.48/Body.114 与段 SEG11/SEG22，数据记入 plan.json/Excel/layout.json；打折画法作废）。IP 实测：硬规则 10/10（H1 豁免），分支 108/110，X 交叉 0，图纸 2338.4×1325.2mm。
+- `unfold_2d_v6.py`：v6（前主程序，已被 v6p1 取代，留作追溯）。§十四 逐层最长路径：段级生成树上逐层取最长简单路径为脊线、整条拉直垂直于上级脊线；两阶段分离（plan.json 方案先于放置）；硬规则 10 项（任一失败不出图）+ 清单自证；DXF 回读为交付前验证。IP 实测：X 交叉 0 对；H1 竖向居中 14.45% 由用户 2026-11-17 21:39 决定豁免通过（名义阈值仍 5%，清单带 exempt 标记），硬规则 10/10；DXF/Excel 已生成待验证，网页查看器已交付。
 - `unfold_2d_v5.py`：v5（主干 = 最长连接器—连接器路径整条拉直；分支逐根挂、非脊线；硬规则 9/9 通过，X 交叉 11 对）。
 - `unfold_2d_v4.py`：v4（主干 = 最长单根管子，已作废，留作追溯）。
 - `unfold_2d_v3_fix.py`：v3 修正版（PCA 投影 + 主干居中 + 分支点先清点）。
@@ -19,10 +21,15 @@
 ## 用法
 
 ```bash
-python3 unfold_2d_v6.py topology.json -o out_dir
+# 第一步：布局（v6p1）
+python3 unfold_2d_v6p1.py topology.json -o out_dir
+# 第二步：过路点合并 + 自环符号（v6p2 后处理）
+python3 merge_joints_v6p2.py out_dir/layout.json topology.json out_dir_v6p2
+# 查看器
+python3 make_viewer.py out_dir_v6p2/layout.json viewer.html
 ```
 
-输出：`unfold_v6.dxf`（块输出）、`unfold_v6.xlsx`、`layout.json`、`plan.json`、`checklist_v6.md`、`branch_layers.md`、`comparison_v6.md`（硬规则失败时只出后五项，不出 DXF/Excel）。
+第一步输出：`unfold_v6p1.dxf`（块输出）、`unfold_v6p1.xlsx`、`layout.json`、`plan.json`、`checklist_v6p1.md`、`branch_layers.md`、`comparison_v6p1.md`（硬规则失败时只出后五项，不出 DXF/Excel）。第二步输出：合并后 `layout.json` + `merge_report_v6p2.md`。
 
 依赖：`ezdxf`、`openpyxl`。输入为四步管线输出的 `topology.json`（branches 含 key/length/dia/node0/node1/polyline，nodes 含 code/type/xyz）。
 
