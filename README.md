@@ -31,6 +31,19 @@ python code/topology_3d_to_2d.py topology.json -o output.dxf
 python code/batch_convert.py input_dir output_dir
 ```
 
+## 树形展开路线（unfold_2d/）
+
+另一条展开路线：按主干—分支层级把 3D 拓扑摊平，长度 1:1、拓扑不变。需求与规则见 [unfold_2d/需求说明.md](unfold_2d/需求说明.md)。
+
+- v4（当前主程序）：主干 = 最长单根放水平；分支垂直于上级主干，逐级交替；同点第三根起偏 30°；硬规则 9 项（任一失败不出图），输出规则检查清单。
+- v3 / v3-fix：早期版本，留作追溯。
+
+```bash
+python3 unfold_2d/unfold_2d_v4.py topology.json -o out_dir
+```
+
+输出：DXF（块输出）、Excel、layout.json、checklist_v4.md、comparison_v4.md（v1/v3-fix/v4 对比）。
+
 ## 输出示例
 
 生成的DXF文件包含：
