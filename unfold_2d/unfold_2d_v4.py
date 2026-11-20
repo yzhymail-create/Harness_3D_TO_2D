@@ -544,12 +544,19 @@ class LayoutV4(LayoutFix):
             for idx, pc in enumerate(run):
                 j = i0 + idx  # 该段起点关节下标
                 if pc['na'] == pc['nb']:
-                    # 自环：三角形（方向取路径切向，试 6 个朝向取不干涉的）
+                    # §十八：退化短管画直线短线头（不是环）；真环画小三角
                     jp = joint_pos.get(j)
                     if jp is None:
                         jp = point_at(s_acc)
                         joint_pos[j] = jp
                     tang = angle_of(path[0], path[-1])
+                    if pc.get('stub'):
+                        tick, bad = self._tick_best(
+                            jp, tang, pc['length'], check_subs)
+                        seg_pts[pc['seg']] = tick
+                        pts_out += tick[1:]
+                        joint_pos[j + 1] = jp
+                        continue
                     tri, bad = None, None
                     for k in range(24):
                         t = self.triangle_loop(jp, tang + 15.0 * k, pc['length'])
@@ -605,6 +612,20 @@ class LayoutV4(LayoutFix):
                 pc = pieces[i]
                 j_next = i + 1 if direction > 0 else i
                 if pc['na'] == pc['nb']:
+                    # §十八：退化短管画直线短线头（不是环）；真环画小三角
+                    if pc.get('stub'):
+                        tick, bad = self._tick_best(
+                            cur, ang, pc['length'], check_subs)
+                        seg_pts[pc['seg']] = tick if direction > 0 \
+                            else tick[::-1]
+                        accept_subs([(tick[0], tick[1])], skip_dist=True)
+                        if bad:
+                            n_bad += bad
+                            warnings.append(
+                                f"{key}/{pc['seg']} 短线头与已画线干涉")
+                        pts_out += tick[1:]
+                        joint_pos[j_next] = cur
+                        continue
                     # 自环三角：试 24 个朝向（15° 步进），取干涉最少的
                     tri, bad = None, None
                     for k in range(24):

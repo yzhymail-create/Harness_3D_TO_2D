@@ -143,6 +143,7 @@ class Topo:
             self.segs[s['seg']] = {
                 'branch': s.get('branch'), 'na': s.get('na'), 'nb': s.get('nb'),
                 'length': float(s.get('length', 0)), 'dia': float(s.get('dia', 0)),
+                'stub': bool(s.get('stub', False)),  # §十八：退化短管标记
             }
         for b in self.raw.get('branches', []):
             key = b.get('key') or b.get('occ')
@@ -151,7 +152,8 @@ class Topo:
                 if sg in self.segs:
                     s = self.segs[sg]
                     pieces.append({'seg': sg, 'na': s['na'], 'nb': s['nb'],
-                                   'length': s['length'], 'dia': s['dia']})
+                                   'length': s['length'], 'dia': s['dia'],
+                                   'stub': s.get('stub', False)})
             if not pieces:
                 # 无 segs 列表的分支：整根当一段（端点 node0/node1）
                 pieces.append({'seg': key, 'na': b.get('node0'), 'nb': b.get('node1'),
@@ -162,6 +164,12 @@ class Topo:
                 'node0': b.get('node0'), 'node1': b.get('node1'),
                 'pieces': pieces,
             }
+        self.dropped_branches = []   # §二十二 drop_branches() 删掉的分支 key（按原顺序）
+        self._build_indices()
+
+    def _build_indices(self):
+        """节点->分支、分支邻接索引（__init__ 与 drop_branches() 共用，
+        抽出来保证两处建的索引完全一致）。"""
         # 节点 -> 分支
         self.node_branches = defaultdict(set)
         for key, b in self.branches.items():
@@ -176,6 +184,46 @@ class Topo:
                 for j in range(i+1, len(ks)):
                     self.branch_adj[ks[i]].add(ks[j])
                     self.branch_adj[ks[j]].add(ks[i])
+
+    def drop_branches(self, keys):
+        """§二十二：删掉指定分支（过孔零件等非路径件）及只属于它们的线段
+        与节点，并重建索引。返回实际删掉的分支 key 列表（按拓扑原顺序；
+        清单里没有的分支静默跳过）。拓扑文件本身不动，只改内存里的对象；
+        被删记录在 self.dropped_branches，供布局 meta 与清单引用。"""
+        drop = [k for k in self.branches if k in keys]
+        if not drop:
+            self.dropped_branches = []
+            return []
+        drop_set = set(drop)
+        drop_segs = {sg for sg, s in self.segs.items()
+                     if s['branch'] in drop_set}
+        keep_nodes = set()
+        for k, b in self.branches.items():
+            if k in drop_set:
+                continue
+            for pc in b['pieces']:
+                keep_nodes.add(pc['na'])
+                keep_nodes.add(pc['nb'])
+        drop_nodes = {c for c in self.nodes if c not in keep_nodes}
+        for k in drop:
+            del self.branches[k]
+        for sg in drop_segs:
+            del self.segs[sg]
+        for c in drop_nodes:
+            del self.nodes[c]
+        # raw 同步（下游不读 raw，但对象内不留残留）
+        self.raw['branches'] = [
+            b for b in self.raw.get('branches', [])
+            if (b.get('key') or b.get('occ')) not in drop_set]
+        self.raw['segments'] = [
+            s for s in self.raw.get('segments', [])
+            if s.get('seg') not in drop_segs]
+        self.raw['nodes'] = [
+            n for n in self.raw.get('nodes', [])
+            if n.get('code') not in drop_nodes]
+        self._build_indices()
+        self.dropped_branches = drop
+        return drop
 
     def branch_nodes(self, key):
         """分支上的关节节点（node0→node1 顺序，去重保序）。"""
@@ -320,6 +368,19 @@ class Layout:
         p1 = add_pt(p, unit_from_angle(direction_deg), s)
         p2 = add_pt(p1, unit_from_angle(direction_deg + 120.0), s)
         return [p, p1, p2, p]
+
+    def _tick_best(self, p, base_angle, length, check_subs):
+        """§十八：退化短管画直线短线头（不是环）。24 朝向 15° 步进试选，
+        取干涉最少者；平局取先试到的（确定性）。返回 ([p, far], bad)。"""
+        best, bad = None, None
+        for k in range(24):
+            far = add_pt(p, unit_from_angle(base_angle + 15.0 * k), length)
+            b = check_subs([(p, far)], skip_dist=True)
+            if bad is None or b < bad:
+                best, bad = [p, far], b
+                if b == 0:
+                    break
+        return best, bad
 
     def kink_points(self, a, b, length, side=1):
         """A→B 两点间、总长 length 的单折点：返回 [a, kink, b]。
@@ -510,12 +571,19 @@ class Layout:
             for idx, pc in enumerate(run):
                 j = i0 + idx  # 该段起点关节下标
                 if pc['na'] == pc['nb']:
-                    # 自环：三角形（方向取路径切向，试 6 个朝向取不干涉的）
+                    # §十八：退化短管画直线短线头（不是环）；真环画小三角
                     jp = joint_pos.get(j)
                     if jp is None:
                         jp = point_at(s_acc)
                         joint_pos[j] = jp
                     tang = angle_of(path[0], path[-1])
+                    if pc.get('stub'):
+                        tick, bad = self._tick_best(
+                            jp, tang, pc['length'], check_subs)
+                        seg_pts[pc['seg']] = tick
+                        pts_out += tick[1:]
+                        joint_pos[j+1] = jp
+                        continue
                     tri, bad = None, None
                     for k in range(24):
                         t = self.triangle_loop(jp, tang + 15.0*k, pc['length'])
@@ -563,6 +631,20 @@ class Layout:
                 pc = pieces[i]
                 j_next = i+1 if direction > 0 else i
                 if pc['na'] == pc['nb']:
+                    # §十八：退化短管画直线短线头（不是环）；真环画小三角
+                    if pc.get('stub'):
+                        tick, bad = self._tick_best(
+                            cur, ang, pc['length'], check_subs)
+                        seg_pts[pc['seg']] = tick if direction > 0 \
+                            else tick[::-1]
+                        accept_subs([(tick[0], tick[1])], skip_dist=True)
+                        if bad:
+                            n_bad += bad
+                            warnings.append(
+                                f"{key}/{pc['seg']} 短线头与已画线干涉")
+                        pts_out += tick[1:]
+                        joint_pos[j_next] = cur
+                        continue
                     # 自环三角：试 24 个朝向（15° 步进），取干涉最少的
                     tri, bad = None, None
                     for k in range(24):

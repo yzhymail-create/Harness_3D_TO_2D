@@ -70,6 +70,7 @@ except ImportError:
 
 from unfold_2d_v3 import (
     Topo, Layout, write_dxf, write_excel, dist, angle_of,
+    add_pt, unit_from_angle,
     seg_proper_intersect, seg_collinear_overlap, seg_seg_dist,
     pt_eq, CLEARANCE_DEFAULT,
 )
@@ -348,6 +349,13 @@ class LayoutV5(LayoutV4):
         for pc in pieces:
             sg = pc['seg']
             if pc['na'] == pc['nb']:
+                if pc.get('stub'):
+                    # §十八：退化短管画直线短线头（不是环），固定朝上
+                    tick = [pos[cur], add_pt(pos[cur],
+                                             unit_from_angle(90.0),
+                                             pc['length'])]
+                    seg_pts[sg] = tick if forward else tick[::-1]
+                    continue
                 # 自环三角形：固定朝上（+90°），三边均不与主干线共线
                 tri = self.triangle_loop(pos[cur], 90.0, pc['length'])
                 seg_pts[sg] = tri if forward else tri[::-1]

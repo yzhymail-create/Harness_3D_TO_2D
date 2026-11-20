@@ -42,11 +42,13 @@ r=5.0 不是 0.1；NODE 圆 r=3.0 不是 2.0；CONNECTOR 是 10 个 ATTDEF 不�
     里 0 处，规则先记着）；TYPE='fork'；CHANGED=''。
   SEGMENT（每分支一个，管子的长度块，插在弧长中点，直接放线上）：
     L=3D 弧长（1 位小数）；E1=起点节点；E2=终点节点；CHANGED=''。
+    E1/E2 用 §二十八显示名（连接器端真名，其余编号，见 _disp_name）。
   LENGTH（只给多段分支的 piece 放，单段分支不放——单段时 piece 长度与整
     管长度完全相同，放了就是重复表达；插在 piece 中点沿法线向下偏移 16mm
     处）：L=piece 折线长度（1 位小数，布局是等长展开，2D≈3D）；E1=na；
-    E2=nb；PART_OF=段自身端点对名 na_nb（如 BN01_CLP23，按左前门线束参考
-    模型，2026-11-18 19:50 用户定改）；TYPE/CHANGED=''。
+    E2=nb（同样用 §二十八显示名）；PART_OF=段自身端点对名 na_nb（如
+    BN01_CLP23，按左前门线束参考模型，2026-11-18 19:50 用户定改；机器
+    标识，仍用编号对，不改）；TYPE/CHANGED=''。
 - 管子不是块：普通 LWPOLYLINE 直接画在模型空间（TUBES 层）；旧的纯文字
   长度标签删除，改由 SEGMENT 块承担。管子全名在 Excel 里。
 - 属性显示规则（2026-11-18 19:21 用户定）：连接器/卡扣只显示名字
@@ -88,7 +90,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, '/home/hatch/workspace/.pylibs')
 
 from unfold_2d_v3 import arc_midpoint  # noqa: E402
-from make_viewer import _label_name  # noqa: E402
+from make_viewer import _label_name, _disp_name  # noqa: E402
 
 DXF_VERSION = 'R2000'          # 用户 CAD 兼容性最好（SKILL.md）；R2010 打不开
 DXF_READBACK_TOL_MM = 0.01     # 同 v6p1：逐块回读最大误差 ≤0.01mm
@@ -245,19 +247,24 @@ def _node_values(n):
     return {'NAME': n['code'], 'TYPE': n.get('type', ''), 'CHANGED': ''}
 
 
-def _segment_values(b):
+def _segment_values(b, nodes_by_code):
     """SEGMENT 属性值（管子的长度块，每分支一个）：L=3D 弧长，E1/E2=两端
-    节点，CHANGED 留空。"""
-    return {'L': f"{b['len_3d']:.1f}", 'E1': b['node0'], 'E2': b['node1'],
+    节点（§二十八显示名：连接器端真名，其余编号），CHANGED 留空。"""
+    return {'L': f"{b['len_3d']:.1f}",
+            'E1': _disp_name(nodes_by_code, b['node0']),
+            'E2': _disp_name(nodes_by_code, b['node1']),
             'CHANGED': ''}
 
 
-def _length_values(b, pc):
-    """LENGTH 属性值（每 piece 一个）：L=piece 折线长，E1/E2=两端节点，
-    PART_OF=段自身端点对名（na_nb，如 BN01_CLP23；2026-11-18 19:50 用户定
-    按左前门线束参考模型改，原先填所属管子短名），TYPE/CHANGED 留空。"""
+def _length_values(b, pc, nodes_by_code):
+    """LENGTH 属性值（每 piece 一个）：L=piece 折线长，E1/E2=两端节点
+    （§二十八显示名），PART_OF=段自身端点对名（na_nb，如 BN01_CLP23；
+    2026-11-18 19:50 用户定按左前门线束参考模型改，原先填所属管子短名；
+    机器标识，仍用编号对，不改），TYPE/CHANGED 留空。"""
     pts = [(float(x), float(y)) for x, y in pc['pts']]
-    return {'L': f"{_piece_len(pts):.1f}", 'E1': pc['na'], 'E2': pc['nb'],
+    return {'L': f"{_piece_len(pts):.1f}",
+            'E1': _disp_name(nodes_by_code, pc['na']),
+            'E2': _disp_name(nodes_by_code, pc['nb']),
             'PART_OF': f"{pc['na']}_{pc['nb']}", 'TYPE': '', 'CHANGED': ''}
 
 
@@ -279,8 +286,14 @@ def write_dxf_from_layout(d, out_path):
 
     branches = d['branches']
     nodes = d['nodes']
+    nodes_by_code = {n['code']: n for n in nodes}
     for b in branches:
         assert len(b['points']) >= 2, f"分支点列不足 2 点：{b['key']}"
+    # §二十七防御：自环布局（旧版）直接报错不出图——自环须先过合并处理去掉
+    _loop_b = [b['key'] for b in branches
+               if b['node0'] == b['node1'] or 'loop' in b]
+    assert not _loop_b, (
+        f'布局含自环路径/loop 条目（须先过合并处理去掉）：{_loop_b[:5]}')
 
     doc = ezdxf.new(DXF_VERSION)
     doc.units = ezdxf.units.MM
@@ -333,7 +346,8 @@ def write_dxf_from_layout(d, out_path):
         mx, my = arc_midpoint(pts)
         ins = msp.add_blockref('SEGMENT', insert=(mx, my),
                                dxfattribs={'layer': 'SEGMENT'})
-        _add_attribs(ins, 'SEGMENT', _segment_values(b), mx, my)
+        _add_attribs(ins, 'SEGMENT', _segment_values(b, nodes_by_code),
+                     mx, my)
 
     # --- LENGTH：只给多段分支的 piece 放（单段分支的 piece 长度与整管
     # 长度完全相同，放了就是重复表达，用户 2026-11-18 19:03 指出后改掉） ---
@@ -345,7 +359,8 @@ def write_dxf_from_layout(d, out_path):
             ix, iy = _piece_place(pts)
             ins = msp.add_blockref('LENGTH', insert=(ix, iy),
                                    dxfattribs={'layer': 'LENGTH'})
-            _add_attribs(ins, 'LENGTH', _length_values(b, pc), ix, iy)
+            _add_attribs(ins, 'LENGTH', _length_values(b, pc, nodes_by_code),
+                         ix, iy)
 
     doc.saveas(out_path)
     return out_path
@@ -409,6 +424,7 @@ def verify_dxf(d, dxf_path):
     except Exception as e:
         return False, [f"DXF 读回失败：{e}"]
     msp = doc.modelspace()
+    nodes_by_code = {n['code']: n for n in d['nodes']}
 
     # --- 图层：6 层都在，旧层名不应存在 ---
     layer_names = {l.dxf.name for l in doc.layers}
@@ -639,7 +655,7 @@ def verify_dxf(d, dxf_path):
         if err > DXF_READBACK_TOL_MM:
             return False, [f"分支 {b['key'][:40]} 的 SEGMENT 位置不对"]
         ok, msg, max_err = _check_attribs(
-            ins, 'SEGMENT', _segment_values(b), mx, my,
+            ins, 'SEGMENT', _segment_values(b, nodes_by_code), mx, my,
             f"SEGMENT {b['key'][:40]}", max_err)
         if not ok:
             return False, [msg]
@@ -682,12 +698,71 @@ def verify_dxf(d, dxf_path):
         if err > DXF_READBACK_TOL_MM:
             return False, [f"piece {pc['seg']} 的 LENGTH 位置不对"]
         ok, msg, max_err = _check_attribs(
-            ins, 'LENGTH', _length_values(b, pc), ix, iy,
+            ins, 'LENGTH', _length_values(b, pc, nodes_by_code), ix, iy,
             f"LENGTH {pc['seg']}", max_err)
         if not ok:
             return False, [msg]
     details.append(f"LENGTH：{len(by_block['LENGTH'])}/{total_pieces} 个，"
                    f"L/E1/E2/PART_OF 属性值与位置全对")
+
+    # --- 路由就绪（§二十八）：SEGMENT/LENGTH 的 E1/E2 显示名须对得上节点块 ---
+    # 标识名从 DXF 回读收集（不复用布局字典）：CONNECTOR 块的 NAME 或 TAG；
+    # NODE/FORK 块的 NAME。管子级（SEGMENT）须 100% 对得上，否则不交付；
+    # LENGTH 只报解析率（段端点指向已合并过路点是 §十六固有情况，不拦）。
+    # 一个显示名对多个节点块是歧义（同一连接器实体在两处节点出现），
+    # 只警告、不拦，列入报告（须用户定夺怎么区分，不编造后缀）。
+    ident_to_codes = {}
+    for ins in by_block['CONNECTOR']:
+        atts = {a.dxf.tag: _decode_dxf_text(a.dxf.text) for a in ins.attribs}
+        code = atts.get('TAG')
+        for ident in {atts.get('NAME', ''), code}:
+            if ident:
+                ident_to_codes.setdefault(ident, []).append(code)
+    for blk_name in ('NODE', 'FORK'):
+        for ins in by_block[blk_name]:
+            atts = {a.dxf.tag: _decode_dxf_text(a.dxf.text)
+                    for a in ins.attribs}
+            code = atts.get('NAME')
+            if code:
+                ident_to_codes.setdefault(code, []).append(code)
+    ambig = sorted(k for k, v in ident_to_codes.items() if len(set(v)) > 1)
+    # 先收齐 SEGMENT＋LENGTH 实际用作端点显示名的标识（歧义只报用过的）
+    used_idents = set()
+    for blk_name in ('SEGMENT', 'LENGTH'):
+        for ins in by_block[blk_name]:
+            atts = {a.dxf.tag: _decode_dxf_text(a.dxf.text)
+                    for a in ins.attribs}
+            used_idents.add(atts.get('E1', ''))
+            used_idents.add(atts.get('E2', ''))
+    seg_bad = []
+    for ins in by_block['SEGMENT']:
+        atts = {a.dxf.tag: _decode_dxf_text(a.dxf.text) for a in ins.attribs}
+        for tag in ('E1', 'E2'):
+            if atts.get(tag, '') not in ident_to_codes:
+                seg_bad.append((tag, atts.get(tag, '')))
+    if seg_bad:
+        return False, [f"路由就绪：SEGMENT 端点对不上节点块：{seg_bad[:5]}，"
+                       "不交付"]
+    details.append(f"路由就绪：SEGMENT 端点 "
+                   f"{len(by_block['SEGMENT']) * 2}/"
+                   f"{len(by_block['SEGMENT']) * 2} 对得上节点块（100%）")
+    # 歧义只报实际用作端点显示名的（节点块上有但端点没用的不报——如
+    # "默认连接器" NAME 30 个相同，但端点显示一律用编号，从不用它）
+    ambig_used = [k for k in ambig if k in used_idents]
+    if ambig_used:
+        details.append("路由歧义（警告，不拦）："
+                       f"{len(ambig_used)} 个显示名对多个节点块："
+                       + '；'.join(f"{k}→{sorted(set(ident_to_codes[k]))}"
+                                   for k in ambig_used))
+    len_total = len(by_block['LENGTH']) * 2
+    len_ok = 0
+    for ins in by_block['LENGTH']:
+        atts = {a.dxf.tag: _decode_dxf_text(a.dxf.text) for a in ins.attribs}
+        for tag in ('E1', 'E2'):
+            if atts.get(tag, '') in ident_to_codes:
+                len_ok += 1
+    details.append(f"LENGTH 端点解析率：{len_ok}/{len_total}"
+                   "（未解析的是 §十六已合并过路点，不拦）")
     if max_err > DXF_READBACK_TOL_MM:
         return False, [f"INSERT/属性位置最大误差 {max_err:.4f}mm，超 0.01mm"]
     details.append(f"INSERT/属性位置最大误差 {max_err:.4f}mm")
@@ -709,6 +784,7 @@ def verify_dxf(d, dxf_path):
 def write_excel_from_layout(d, out_path):
     """Excel 配套表（v3 write_excel 的字典版）：2D管子/2D线段/2D节点/验证。"""
     import openpyxl
+    nodes_by_code = {n['code']: n for n in d['nodes']}
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = '2D管子'
@@ -749,7 +825,9 @@ def write_excel_from_layout(d, out_path):
                                pts[i + 1][1] - pts[i][1])
                     for i in range(len(pts) - 1))
             dia = comp_dia.get(pc['seg'], b.get('dia'))
-            ws2.append([pc['seg'], b['key'], pc['na'], pc['nb'],
+            ws2.append([pc['seg'], b['key'],
+                        _disp_name(nodes_by_code, pc['na']),
+                        _disp_name(nodes_by_code, pc['nb']),
                         round(pts[0][0], 2), round(pts[0][1], 2),
                         round(pts[-1][0], 2), round(pts[-1][1], 2),
                         round(L, 1), round(dia, 1) if dia is not None else ''])
@@ -774,6 +852,14 @@ def write_excel_from_layout(d, out_path):
         ws4.append(['已排除（不过孔零件不画）', '原因'])
         for rec in d['meta']['excluded_branches']:
             ws4.append([rec['key'], rec.get('reason', '')])
+    if d.get('meta', {}).get('dropped_loop_segments'):
+        ws4.append([])
+        ws4.append(['自环段去掉（§二十七，不画）', '段', '节点', '长度(mm)',
+                    '整根去掉'])
+        for rec in d['meta']['dropped_loop_segments']:
+            ws4.append([rec['branch'], rec['seg'], rec['node'],
+                        rec['length_mm'],
+                        '是' if rec['whole_branch'] else '否'])
     if d.get('hidden_parallel'):
         ws4.append([])
         ws4.append(['平行未单画（§十五）', '隐藏分支/段', '长度', '直径', '只画'])

@@ -133,6 +133,12 @@ SPINE_STRAIGHT_TOL_MM = 0.01    # H10：脊线共线，关节到脊线垂距 ≤
 DXF_READBACK_TOL_MM = 0.01      # 交付前验证：DXF 回读逐块最大误差 ≤0.01mm（非清单项）
 TOP_SIDE_SEARCH_N = 6           # 放置侧搜索：一级脊线中子树总长最大的 6 条
 SPINE_DIR_TOL_DEG = 0.5         # 脊线方向与分配方向的容差（度）
+# §二十二 过孔零件排除清单（分支 key → 原因），只在此处定义：
+# 清单里的分支不是线束路径，展开入口加载拓扑后删掉（Topo.drop_branches），
+# 拓扑文件本身不动。用户再认出过孔零件往这里加一行即可。
+EXCLUDED_BRANCHES = {
+    'C289': '过孔零件，非线束路径（2026-11-18 用户定）',
+}
 
 
 class LayoutV6p1(LayoutV5):
@@ -151,12 +157,15 @@ class LayoutV6p1(LayoutV5):
         self.branch_spine = {}      # branch -> spine id
         self.seg_tree_adj = {}      # 段级生成树邻接：node -> [(nbr, seg, len)]
         self.dropped_segs = {}      # seg -> 原因（平行对去掉的段）
+        self.dropped_ring_segs = {}  # seg -> 原因（真环去掉的闭环段）
         self._comps = []            # 连通分量（topo.components() 顺序）
         self._main_comp = 0         # 主分量下标（含全局主干路径的分量）
+        self._ring_spines = set()   # 按 §六整体画环的闭环脊线 id（H10 豁免）
         self._spine_joint_branch = {}  # (spine_id, joint) -> 该脊线中含此关节的最后分支
         self.side_override = {}     # {脊线首根分支: 0=分配侧, 1=翻转侧}（放置侧搜索用）
         self.plan = None            # 第一阶段产物（build_plan 组装，见 §十四铁律）
         self.plan_path = None       # plan.json 写盘路径（main 设定；None 则不写盘）
+        self.excluded_branches = []  # §二十二：已排除分支 [{key, reason}]（build_layout 填）
         # ---- §十五 平行对只画一根（2026-11-17 22:21 用户定，v6p1 新增） ----
         # 全部在分解阶段（先算后画）定死，放置阶段只读。隐藏的是“线段”，
         # 不是“数据”：隐藏段的分支/长度/直径全数记入 hidden_parallel，
@@ -165,6 +174,12 @@ class LayoutV6p1(LayoutV5):
         self.hidden_parallel_segs = set()   # 隐藏的线段 id（放置时跳过）
         self.hidden_whole_branches = set()  # 整根隐藏的分支（全部段都被隐藏）
         self.hidden_seg_len_by_branch = {}  # branch -> 该分支被隐藏段总长（H2 用）
+        # ---- 环弦符号（2026-11-18 v6p2 配套，§六环优先 interim） ----
+        # 弧长 < 两端点距离的受约束段（1:1 直线在几何上不可能），不画
+        # 对角线，改画等边小三角符号（周长=弧长）于一端，另一端只记
+        # 节点坐标；真值在弹窗里。登记 [{seg, branch, na, nb, length_mm,
+        # dia_mm, at}]，merge 按自环通道改画小环符号。
+        self.symbol_segs = []
 
     # ---------- 自测（v6p1 覆盖：§十五隐藏段按应画长度核查） ----------
     def validate(self):
@@ -193,8 +208,9 @@ class LayoutV6p1(LayoutV5):
     # ---------- 段级生成树 ----------
     def build_seg_tree(self):
         """段级生成树：全部非自环段，平行对去掉一个（优先去掉非主干段，
-        否则去掉较短的；主干段全保留）。返回邻接表；IP 应为 109 边/110 节点
-        且连通（自环 3 + 平行对 4 去掉后 116−3−4=109）。"""
+        否则去掉较短的；主干段全保留）；真环每环去掉闭环段（地板 4 个，
+        IP 为 0）。返回邻接表；IP 应为 109 边/110 节点且连通（自环 3 +
+        平行对 4 去掉后 116−3−4=109）。"""
         trunk_segs = set()
         for k in self.trunk_path:
             for pc in self.topo.branches[k]['pieces']:
@@ -214,10 +230,22 @@ class LayoutV6p1(LayoutV5):
             else:
                 drop[b] = f"平行对去短段（{lb:.1f} ≤ {la:.1f}）"
         self.dropped_segs = drop
+        # 真环去段（2026-11-18 地板修复）：段级生成树必须是树，否则
+        # _lp_from 的无 visited 集 DFS 会枚举全部简单路径，40 秒吃光
+        # 6GB（地板实测 OOM 根因：4 个真环，含 2 个 47 段大环）。
+        # 每环去掉 find_cycles 的闭环段（rings[i][0]），剩下的恰为生成树；
+        # 被去段仍随其分支画出（尾段），数据不丢。§六环优先画环未实现
+        # （见 layout_component 警告），此处只保树结构，不改规则。
+        ring_drop = {}
+        for r in rings:
+            closing = r[0]
+            if closing not in drop:
+                ring_drop[closing] = f"真环去段（环 {len(r)} 段，闭环段）"
+        self.dropped_ring_segs = ring_drop
         adj = defaultdict(list)
         n_edge = 0
         for sg, s in self.topo.segs.items():
-            if sg in self_loops or sg in drop:
+            if sg in self_loops or sg in drop or sg in ring_drop:
                 continue
             adj[s['na']].append((s['nb'], sg, s['length']))
             adj[s['nb']].append((s['na'], sg, s['length']))
@@ -246,6 +274,11 @@ class LayoutV6p1(LayoutV5):
                        f"段级生成树 {n_edge} 边 / {len(adj)} 节点，"
                        f"{n_comp_seen} 棵树；去掉平行段 {len(drop)} 条"
                        f"{sorted(drop)}，自环段 {len(self_loops)} 条")
+        if ring_drop:
+            # 单独记一条（IP 无真环时不记，布局 MD5 与历史值保持一致）
+            self.log_phase('生成树（真环）',
+                           f"真环 {len(rings)} 个，去闭环段 "
+                           f"{len(ring_drop)} 条{sorted(ring_drop)}")
         if n_edge != n_nodes - n_comp_seen:
             self.warnings.append(
                 f"段级生成树边数 {n_edge} ≠ 节点数−树数 "
@@ -268,8 +301,12 @@ class LayoutV6p1(LayoutV5):
             u, parent, L, segs, nodes = stack.pop()
             if is_conn.get(u) and L > best[0]:
                 best = [L, u, list(segs), list(nodes)]
+            # v not in nodes：只走简单路径（树上恒成立；有环漏网时防
+            # 非简单路径爆炸——2026-11-18 地板教训：无此检查时环上 DFS
+            # 会反复绕环，路径数指数增长）
             nbrs = [(v, sg, w) for v, sg, w in adj.get(u, [])
-                    if sg not in assigned_segs and v != parent]
+                    if sg not in assigned_segs and v != parent
+                    and v not in nodes]
             if not nbrs and u != start and L > best_leaf[0]:
                 best_leaf = [L, u, list(segs), list(nodes)]
             for v, sg, w in nbrs:
@@ -438,11 +475,16 @@ class LayoutV6p1(LayoutV5):
             else:
                 got = self._component_trunk_path(comp)
                 if got is None:
+                    # 无连接器分量（如地板 C289 单分支分量）：无连接器对可跑
+                    # 最长路径，取最长分支作脊线 0；关节须走
+                    # spine_joints_ordered（含中间关节），只取 [node0, node1]
+                    # 会丢中间关节（如 C289 的 CLP01/CLP02），放置时端点
+                    # 未定位、整根分支被丢（2026-11-18 地板实测 H5 失败根因）
                     keys = [sorted(comp, key=lambda k: (-topo.branches[k]['length'], k))[0]]
                     b = topo.branches[keys[0]]
-                    joints = [b['node0'], b['node1']]
+                    joints = spine_joints_ordered(keys, b['node0'])
                     length = b['length']
-                    end = b['node1']
+                    end = joints[-1]
                 else:
                     keys, pj, length, (a, b_) = got
                     joints = spine_joints_ordered(keys, pj[0])
@@ -559,15 +601,24 @@ class LayoutV6p1(LayoutV5):
                                 queue.append(('stub', (pc['na'], ns['id'],
                                                        pc['seg'])))
                             else:
+                                # detached：两端都不在脊线路径上。远端关节须
+                                # 排 stub 探索下游——否则该段被记为已分配，
+                                # 其下游子树永远到不了剥离队列（2026-11-18
+                                # 地板实测：SEG31 切断 CLP05 子树，19 根分支
+                                # 未进脊线、H2 最大误差 +2919.57mm）。远端按
+                                # 自由尾段定位（槽位方向伸出，见放置段）。
                                 kind2 = 'detached'
                                 tail = {'branch': b2, 'spine': ns['id'],
                                         'joint': pc['na'], 'far': pc['nb'],
                                         'seg': pc['seg'],
                                         'length': pc['length'], 'kind': kind2,
                                         'direction': None}
+                                queue.append(('stub', (pc['nb'], ns['id'],
+                                                       pc['seg'])))
                                 self.warnings.append(
                                     f"尾段 {pc['seg']}（{b2}）两端都不在脊线"
-                                    f" {ns['id']} 路径上（不应发生）")
+                                    f" {ns['id']} 路径上，按自由尾段定位远端"
+                                    f"并探索下游")
                             self.tails.append(tail)
                             self.tail_by_seg[pc['seg']] = tail
                     queue.append(('spine', ns))
@@ -576,8 +627,15 @@ class LayoutV6p1(LayoutV5):
         self.unassigned_branches = []
         for key in sorted(set(topo.branches) - assigned_branches):
             pieces = topo.branches[key]['pieces']
-            if len(pieces) == 1 and pieces[0]['na'] == pieces[0]['nb']:
-                reason = '纯自环分支（不计侧枝，画小三角）'
+            if all(pc['na'] == pc['nb'] for pc in pieces):
+                # 全部段都是自环段（单段或多段，如地板 15 根双自环分支）：
+                # 不进生成树、不计侧枝；§十八：退化短管画短线头，真环画小三角
+                # （原条件只认单段，多段自环分支被误标“未分配（不应发生）”，
+                # 2026-11-18 地板实测）
+                if all(pc.get('stub') for pc in pieces):
+                    reason = '退化短管分支（不计侧枝，画短线头）'
+                else:
+                    reason = '纯自环分支（不计侧枝，画小三角）'
             elif all(pc['seg'] in self.dropped_segs for pc in pieces):
                 sibs = []
                 for pc in pieces:
@@ -587,6 +645,9 @@ class LayoutV6p1(LayoutV5):
                             sibs.append(sg2)
                 reason = (f"平行单段分支（段 {pieces[0]['seg']} 与 "
                           f"{','.join(sibs)} 平行，两端已定，打折画出）")
+            elif all(pc['seg'] in self.dropped_ring_segs for pc in pieces):
+                reason = (f"真环闭环段分支（段 {pieces[0]['seg']} 为真环"
+                          f"闭环段，已从生成树去掉；按受约束段画出）")
             else:
                 reason = '未分配（不应发生：既非自环亦非全平行段）'
                 self.warnings.append(f"分支 {key} 未进脊线：{reason}")
@@ -812,7 +873,7 @@ class LayoutV6p1(LayoutV5):
 
         规则（§十三）：第 1 根（主分支）取投影侧 ±90°；第 2 根取对侧
         ±90°；第 3 根起取离投影角最近的剩余槽位（±60/±120/±30/±150）。
-        自由尾段排在脊线之后，同组内占剩余槽位（方向相对本脊线）。
+        自由/detached 尾段排在脊线之后，同组内占剩余槽位（方向相对本脊线）。
         stub 组（第二遍）：子脊线槽位相对尾段方向。
         全部确定性：组内按（-路径长，终点连接器，首根分支）排序。
         """
@@ -823,7 +884,7 @@ class LayoutV6p1(LayoutV5):
                 continue
             groups[(s['parent'], s['anchor'])]['spines'].append(s)
         for t in self.tails:
-            if t['kind'] == 'free':
+            if t['kind'] in ('free', 'detached'):
                 groups[(t['spine'], t['joint'])]['tails'].append(t)
 
         def nearest_slot(rel_ang, taken):
@@ -877,7 +938,7 @@ class LayoutV6p1(LayoutV5):
                     'offset_dev': round(abs(abs(off) - 90.0), 1),
                 }
                 rec[first] = off
-            # 自由尾段：排在脊线之后，占剩余槽位
+            # 自由/detached 尾段：排在脊线之后，占剩余槽位
             for t in tails:
                 rel = self._child_proj_rel(pspine, joint, t['far'],
                                            t['branch'])
@@ -936,11 +997,13 @@ class LayoutV6p1(LayoutV5):
                     'offset_dev': round(abs(abs(off) - 90.0), 1),
                 }
         n_main = sum(1 for s in self.spines if s['level'] > 0 and s['is_main'])
+        n_det = sum(1 for t in self.tails if t['kind'] == 'detached')
         self.log_phase('槽位',
                        f"分配 {len(self.slot_groups)} 个关节组、"
                        f"{len(self.slot_info)} 根脊线首根槽位；"
                        f"主分支 {n_main} 条，自由尾段 "
-                       f"{sum(1 for t in self.tails if t['kind'] == 'free')} 段")
+                       f"{sum(1 for t in self.tails if t['kind'] == 'free')} 段"
+                       + (f"、detached 尾段 {n_det} 段" if n_det else ""))
         return self.slot_info
 
     # ---------- 关节清点（H10 子项：先找齐再画） ----------
@@ -1011,9 +1074,9 @@ class LayoutV6p1(LayoutV5):
             else:
                 pspine = self.spine_by_id[s['parent']]
                 s['direction'] = (pspine['direction'] + off) % 360.0
-        # 自由尾段方向（未在 stub 计算中覆盖的）
+        # 自由/detached 尾段方向（未在 stub 计算中覆盖的）
         for t in self.tails:
-            if t['kind'] == 'free' and t.get('direction') is None:
+            if t['kind'] in ('free', 'detached') and t.get('direction') is None:
                 s = self.spine_by_id[t['spine']]
                 t['direction'] = (s['direction'] +
                                   t.get('slot_offset', 90.0)) % 360.0
@@ -1026,7 +1089,7 @@ class LayoutV6p1(LayoutV5):
                 ('stub', s['anchor'])
             by_joint[key].append((s['direction'], s['branches'][0]))
         for t in self.tails:
-            if t['kind'] == 'free':
+            if t['kind'] in ('free', 'detached'):
                 by_joint[(t['spine'], t['joint'])].append(
                     (t['direction'], t['seg']))
         for key, dirs in by_joint.items():
@@ -1213,15 +1276,25 @@ class LayoutV6p1(LayoutV5):
 
     def _triangle_best(self, p, base_angle, length, check_subs):
         """自环三角 24 朝向试选（15° 步进），取干涉最少者；
-        平局取先试到的（确定性）。返回 (tri, bad)。"""
-        tri, bad = None, None
+        平局取先试到的（确定性）。返回 (tri, bad)，bad 为真实干涉数。
+        选分另加方向罚分：任一边与脊线方向平行（k%4==0，三角三边
+        与 base_angle 的夹角为 0°/120°/240°）的朝向选分 +5——只影响
+        选取，不计入 bad，警告仍报真实干涉数。
+        根因（2026-11-18 地板实测）：三角在脊线分支序中排在被重叠段
+        之前时，试选时后序段尚未放置，k=0（首边沿脊线方向）呈假干净
+        被立即选中；后序路径段按直线放置压过三角底边（SEG66/SEG47
+        各重叠 1.67mm，H4 失败）。罚分 5 的排序：非共线小冲突（1~3）
+        胜共线干净（5），共线干净（5）胜非共线真重叠（10），共线
+        重叠（15）最差；只有选分 0 的朝向才提前终止。"""
+        tri, bad, best_score = None, None, None
         for k in range(24):
             t = self.triangle_loop(p, base_angle + 15.0 * k, length)
             s = [(t[m], t[m + 1]) for m in range(3)]
             b = check_subs(s, skip_dist=True)
-            if bad is None or b < bad:
-                tri, bad = t, b
-                if b == 0:
+            score = b + (5 if k % 4 == 0 else 0)
+            if best_score is None or score < best_score:
+                tri, bad, best_score = t, b, score
+                if b == 0 and k % 4 != 0:
                     break
         return tri, bad
 
@@ -1241,10 +1314,70 @@ class LayoutV6p1(LayoutV5):
                     break
         return best, best_bad
 
+    def ring_polygon(self, lengths):
+        """覆盖 v3：给定各边长，解圆半径 R 使弦多边形闭合，返回顶点（质心在原点）。
+        v3 版假设全部边对劣弧——钝角形（最长边对角 >90°，外心在形外）时
+        最长边应对优弧，v3 的二分收敛到错误半径，闭合边长错（2026-11-18
+        地板实测：C289 弦 65.98/85.92/40.95，v3 排出的第三边 55.13 ≠ 40.95，
+        H2 +13.92mm）。本版分两种情况：先试全劣弧（Σ2·asin=2π）；若
+        R=max/2 处 Σ 仍 <2π（外心在外），改解优弧方程
+        2·asin(Lmax/2R)=Σ其余 2·asin(L/2R)，最长边占优弧。
+        若最长边 >= 其余边之和则无法闭合，返回 None。"""
+        if max(lengths) >= sum(lengths) - max(lengths):
+            return None
+        imax = lengths.index(max(lengths))
+        # 情况一：全劣弧（外心在形内）
+        lo = max(lengths) / 2.0 * 1.000001
+        s_lo = sum(2.0 * math.asin(min(1.0, L / (2.0 * lo)))
+                   for L in lengths)
+        if s_lo > 2.0 * math.pi:
+            hi = 1e7
+            for _ in range(200):
+                mid = (lo + hi) / 2.0
+                s = sum(2.0 * math.asin(min(1.0, L / (2.0 * mid)))
+                        for L in lengths)
+                if s > 2.0 * math.pi:
+                    lo = mid
+                else:
+                    hi = mid
+            R = (lo + hi) / 2.0
+            angs = [2.0 * math.asin(L / (2.0 * R)) for L in lengths]
+        else:
+            # 情况二：最长边占优弧（外心在形外）
+            # f(R)=2·asin(Lmax/2R)−Σ其余 2·asin(L/2R)：R=max/2 处 >0、
+            # R→∞ 处 <0（最长边 < 其余和），二分有根。
+            def f(R):
+                a_max = 2.0 * math.asin(
+                    min(1.0, lengths[imax] / (2.0 * R)))
+                a_rest = sum(2.0 * math.asin(min(1.0, L / (2.0 * R)))
+                             for i, L in enumerate(lengths) if i != imax)
+                return a_max - a_rest
+            lo2 = max(lengths) / 2.0 * 1.000001
+            hi2 = 1e7
+            for _ in range(200):
+                mid = (lo2 + hi2) / 2.0
+                if f(mid) > 0:
+                    lo2 = mid
+                else:
+                    hi2 = mid
+            R = (lo2 + hi2) / 2.0
+            angs = []
+            for i, L in enumerate(lengths):
+                a = 2.0 * math.asin(min(1.0, L / (2.0 * R)))
+                angs.append((2.0 * math.pi - a) if i == imax else a)
+        pts, ang = [], 0.0
+        for a in angs:
+            pts.append((R * math.cos(ang), R * math.sin(ang)))
+            ang += a
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        return [(p[0] - cx, p[1] - cy) for p in pts]
+
     def _place_spine(self, spine, anchor_pt):
         """以脊线为单位放置：先算出全部关节位置（沿脊线方向累计弦长），
         再逐根分支提交（_layout_spine_branch）。anchor_pt 为脊线起点
-        （0 级由调用方按居中/原点定；子脊线为锚点关节已放置位置）。"""
+        （0 级由调用方按居中/原点定；子脊线为锚点关节已放置位置）。
+        闭环脊线（首末关节相同，≥3 个不同关节）按 §六整体画环，不拉直。"""
         topo = self.topo
         u = unit_from_angle(spine['direction'])
         # 段查找：(na, nb) -> 路径段（生成树内唯一）
@@ -1253,6 +1386,33 @@ class LayoutV6p1(LayoutV5):
             s = topo.segs[sg]
             seg_between[(s['na'], s['nb'])] = sg
             seg_between[(s['nb'], s['na'])] = sg
+        # 闭环脊线（§六整体画环）：首末关节相同且 ≥3 个不同关节时，
+        # 不拉直——按 3D 弦长排闭合多边形（ring_polygon），各边再按弧长
+        # 打折补长（见 _layout_spine_branch 路径段的 kink）。弧长不能
+        # 直接作多边形边：弧长是管中心线长，弦才是节点直线距，最长弧
+        # 可能超过其余弧之和（如 C289 SEG526 147.6 > 87.8+41.1），多边形
+        # 闭合不了；3D 弦必满足多边形不等式。
+        joints = spine['joints']
+        if (len(joints) >= 4 and joints[0] == joints[-1]
+                and len(set(joints)) >= 3):
+            ring_nodes = joints[:-1]
+            chords = []
+            for a, b in zip(ring_nodes, ring_nodes[1:] + ring_nodes[:1]):
+                pa = topo.nodes[a]['xyz']
+                pb = topo.nodes[b]['xyz']
+                chords.append(math.dist(pa, pb))
+            poly = self.ring_polygon(chords)
+            if poly is not None:
+                pos = {nd: (anchor_pt[0] + p[0], anchor_pt[1] + p[1])
+                       for nd, p in zip(ring_nodes, poly)}
+                self.rings_drawn.append(
+                    {'segs': list(spine['segs']), 'nodes': list(ring_nodes)})
+                self._ring_spines.add(spine['id'])
+                for b in spine['branches']:
+                    self._layout_spine_branch(b, spine, pos)
+                return
+            self.warnings.append(
+                f"脊线 {spine['id']} 闭环 3D 弦无法排多边形，改走拉直放置")
         # 关节位置：沿脊线方向累计弦长
         pos = {spine['joints'][0]: anchor_pt}
         cur = anchor_pt
@@ -1304,9 +1464,14 @@ class LayoutV6p1(LayoutV5):
             if nd in pos:
                 joint_pos[idx] = pos[nd]
         # 自由尾段远端：沿尾段槽位方向伸出（此时其关节已在 pos 中）
+        # §十五隐藏尾段不定位远端：远端关节已由留下的平行段所在脊线
+        # 定位，在此重算会记入 joint_pos 与 node_pos 冲突（2026-11-18
+        # 地板实测 H3 6 处不一致根因）
         for pc in pieces:
             t = self.tail_by_seg.get(pc['seg'])
             if t is not None and t['kind'] == 'free':
+                if t.get('hidden') or pc['seg'] in self.hidden_parallel_segs:
+                    continue
                 jp = pos.get(t['joint'])
                 if jp is None:
                     warnings.append(f"{key}/{pc['seg']} 自由尾段关节 "
@@ -1317,6 +1482,38 @@ class LayoutV6p1(LayoutV5):
                 pos[t['far']] = far
                 if t['far'] in joints:
                     joint_pos[joints.index(t['far'])] = far
+        # detached 尾段远端：与自由尾段同法定位（沿槽位方向伸出；
+        # 须在自由尾段之后——其关节可能由同分支自由尾段定位，如
+        # SEG31 的关节 BN06 由 SEG39 定位）。远端已定位时不动
+        # （用已有位置画受约束段）。
+        for pc in pieces:
+            t = self.tail_by_seg.get(pc['seg'])
+            if t is None or t['kind'] != 'detached':
+                continue
+            if t.get('hidden') or pc['seg'] in self.hidden_parallel_segs:
+                continue
+            if t['far'] in pos:
+                if t['far'] in joints:
+                    joint_pos[joints.index(t['far'])] = pos[t['far']]
+                continue
+            if t['far'] in self.node_pos:
+                pos[t['far']] = self.node_pos[t['far']]
+                if t['far'] in joints:
+                    joint_pos[joints.index(t['far'])] = pos[t['far']]
+                continue
+            jp = pos.get(t['joint'])
+            if jp is None:
+                warnings.append(f"{key}/{pc['seg']} detached 尾段关节 "
+                                f"{t['joint']} 未定位")
+                continue
+            if t.get('direction') is None:
+                warnings.append(f"{key}/{pc['seg']} detached 尾段方向未定")
+                continue
+            far = add_pt(jp, unit_from_angle(t['direction']),
+                         t['length'])
+            pos[t['far']] = far
+            if t['far'] in joints:
+                joint_pos[joints.index(t['far'])] = far
         # 两遍画：先画非自环段（路径段/尾段），再画自环三角——三角试选
         # 须看到本分支已画的路径段，否则三角首边可能与后续路径段重叠
         # （2026-11-17 实测：Body.117 的 SEG12 三角首边与 SEG13 重叠）。
@@ -1336,6 +1533,17 @@ class LayoutV6p1(LayoutV5):
                 if a_pt is None:
                     warnings.append(f"{key}/{sg} 自环关节 {pc['na']} 未定位")
                     continue
+                if pc.get('stub'):
+                    # §十八：退化短管画直线短线头（不是环）
+                    tick, bad = self._tick_best(
+                        a_pt, spine['direction'], pc['length'], check_subs)
+                    seg_pts[sg] = tick
+                    accept_subs([(tick[0], tick[1])], skip_dist=True)
+                    if bad:
+                        n_bad += bad
+                        warnings.append(
+                            f"{key}/{sg} 短线头与已画线干涉 {bad} 处")
+                    continue
                 tri, bad = self._triangle_best(
                     a_pt, spine['direction'], pc['length'], check_subs)
                 seg_pts[sg] = tri
@@ -1350,14 +1558,20 @@ class LayoutV6p1(LayoutV5):
                 continue
             t = self.tail_by_seg.get(sg)
             if sg in path_segs:
-                chord = self._piece_chord(sg)
+                # 弦取实际端点距与 _piece_chord 的较小者：普通脊线两者
+                # 相等（关节按 _piece_chord 累计）；闭环脊线关节按 3D 弦
+                # 排多边形，实际端点距 < 弧长，须打折补长（否则 H2 报错）
+                chord = min(self._piece_chord(sg), dist(a_pt, b_pt))
                 if chord < pc['length'] - 1e-9:
                     pts, bad = self._kink_best(a_pt, b_pt, pc['length'],
                                                check_subs)
                     bends.append({'branch': key, 'seg': sg,
                                   'at': pc['na'], 'delta': 'kink',
-                                  'note': f"平行预折：弦 {chord:.1f} < "
-                                          f"段长 {pc['length']:.1f}"})
+                                  'note': (f"闭环边打折：弦 {chord:.1f} < "
+                                           f"段长 {pc['length']:.1f}")
+                                  if spine['id'] in self._ring_spines else
+                                  (f"平行预折：弦 {chord:.1f} < "
+                                   f"段长 {pc['length']:.1f}")})
                 else:
                     pts, bad = [a_pt, b_pt], check_subs([(a_pt, b_pt)])
                 seg_pts[sg] = pts
@@ -1366,14 +1580,38 @@ class LayoutV6p1(LayoutV5):
                 if bad:
                     n_bad += bad
                     warnings.append(f"{key}/{sg} 路径段与已画线干涉 {bad} 处")
-            elif t is not None and t['kind'] == 'constrained':
-                # 受约束尾段：两端已定，打折补长（恰好 fitting 时为直线）
+            elif t is not None and t['kind'] in ('constrained', 'detached'):
+                # 受约束/detached 尾段：两端已定，打折补长（恰好 fitting
+                # 时为直线；detached 远端已在上步按槽位方向定位，弦长即弧长）
+                # 环弦符号（2026-11-18）：段长 < 端点距时 1:1 直线在几何上
+                # 不可能（_kink_best 只会拉直，见地板 SEG05 43.5mm 画成
+                # 3079mm 的斜线），改画等边小三角符号（周长=弧长）于近端，
+                # merge 按自环通道改画小环符号；§六环优先待实现后取消。
+                if pc['length'] < dist(a_pt, b_pt) - 1e-9:
+                    tri, bad = self._triangle_best(
+                        a_pt, angle_of(a_pt, b_pt), pc['length'], check_subs)
+                    seg_pts[sg] = tri
+                    self.symbol_segs.append(
+                        {'seg': sg, 'branch': key, 'na': pc['na'],
+                         'nb': pc['nb'], 'length_mm': pc['length'],
+                         'dia_mm': self.topo.branches[key]['dia'],
+                         'at': pc['na']})
+                    subs = [(tri[k], tri[k + 1]) for k in range(3)]
+                    accept_subs(subs, skip_dist=True)
+                    if bad:
+                        n_bad += bad
+                    warnings.append(
+                        f"{key}/{sg} 环弦符号：段长 {pc['length']:.1f} < "
+                        f"端点距 {dist(a_pt, b_pt):.1f}，无法按 1:1 画直线，"
+                        f"画小三角符号于 {pc['na']}（§六环优先待实现）")
+                    continue
                 pts, bad = self._kink_best(a_pt, b_pt, pc['length'],
                                            check_subs)
                 if len(pts) > 2:
                     bends.append({'branch': key, 'seg': sg,
                                   'at': pc['na'], 'delta': 'kink',
-                                  'note': f"受约束尾段打折：弦 "
+                                  'note': f"{'受约束' if t['kind'] == 'constrained' else 'detached'}"
+                                          f"尾段打折：弦 "
                                           f"{dist(a_pt, b_pt):.1f} < "
                                           f"段长 {pc['length']:.1f}"})
                 seg_pts[sg] = pts
@@ -1422,6 +1660,53 @@ class LayoutV6p1(LayoutV5):
         self.placed_angle[key] = spine['direction']
         return True
 
+    def place_branch_best(self, key):
+        """覆盖 v3：单段未分配分支若两端已定且段长 < 端点距（1:1 直线在
+        几何上不可能），不画对角线，改画等边小三角符号（周长=弧长）于
+        一端（§六环优先 interim：地板 SEG05 43.5mm 曾被 v3 拉直成
+        3079mm 的斜线，H2 失败）。三角朝向取 24 朝向中干涉最少者（同
+        _triangle_best，含避开脊线方向的罚分）。其余分支走 v3 原逻辑。
+        多段分支若含不可能受约束段暂不处理（数据中无此情况），仍走
+        v3 原逻辑并由其记录长度误差。"""
+        b = self.topo.branches[key]
+        pieces = b['pieces']
+        if len(pieces) == 1:
+            pc = pieces[0]
+            if pc['na'] != pc['nb']:
+                A = self.node_pos.get(pc['na'])
+                B = self.node_pos.get(pc['nb'])
+                if (A is not None and B is not None
+                        and pc['length'] < dist(A, B) - 1e-9):
+                    def check_subs(subs, skip_dist=False):
+                        bad = 0
+                        for (q1, q2) in subs:
+                            if self.piece_overlaps(q1, q2, []):
+                                bad += 10
+                            elif self.piece_conflicts(
+                                    q1, q2, [], skip_dist=skip_dist):
+                                bad += 1
+                        return bad
+                    tri, bad = self._triangle_best(
+                        A, angle_of(A, B), pc['length'], check_subs)
+                    res = {'points': tri,
+                           'pieces': {pc['seg']: (tri[0], tri[-1])},
+                           'seg_pts': {pc['seg']: tri},
+                           'joint_pos': {0: A, 1: B},
+                           'bends': [],
+                           'warnings': [f"{key}/{pc['seg']} 环弦符号：段长 "
+                                        f"{pc['length']:.1f} < 端点距 "
+                                        f"{dist(A, B):.1f}，无法按 1:1 画直线，"
+                                        f"画小三角符号于 {pc['na']}"
+                                        f"（§六环优先待实现）"],
+                           'n_bad': bad}
+                    self.symbol_segs.append(
+                        {'seg': pc['seg'], 'branch': key, 'na': pc['na'],
+                         'nb': pc['nb'], 'length_mm': pc['length'],
+                         'dia_mm': b['dia'], 'at': pc['na']})
+                    self._commit(key, res)
+                    return True
+        return super().place_branch_best(key)
+
     # ---------- 分量布局（脊线 0 → 子脊线 BFS → 未分配分支） ----------
     def layout_component(self, comp_keys, origin):
         """一个连通分量的展开：先放脊线 0（主分量居中），再按 BFS 层序
@@ -1439,8 +1724,9 @@ class LayoutV6p1(LayoutV5):
         spines = [s for s in self.spines if s['comp'] == ci]
         if rings:
             self.warnings.append(
-                f"分量含 {len(rings)} 个真环，v6p1 路径主干优先放置，"
-                f"环分支按受约束段处理（§六环优先未实现，见清单局限）")
+                f"分量含 {len(rings)} 个真环：闭环脊线按 §六整体画环，"
+                f"其余环分支按受约束段处理；弧长<端点距的环弦画小三角"
+                f"符号（§六未全实现，见清单局限）")
         for s in spines:
             if s['level'] != 0:
                 continue
@@ -1518,6 +1804,164 @@ class LayoutV6p1(LayoutV5):
                        f"{dev:.2f}% X={n_x} 间距<5mm={n_near} 共线重叠={n_ov}；"
                        f"翻转侧：{flipped if flipped else '无'}")
 
+    # ---------- 孤岛分量就近放置（§十九） ----------
+    def relocate_island_components(self, clearance=20.0, max_radius=1200.0):
+        """孤岛分量就近放置（2026-11-18，用户报“孤岛路径”）。
+
+        非主分量（与主线束无连接的独立分量，如 C289 真环）不再一律放
+        主分量包围盒右侧（3D 里贴着 20.1-23X、图上却隔 4747mm），而是
+        放到它在 3D 里最近的邻居节点附近的干净空位，图面反映真实空间
+        关系。平移是刚体变换：长度、角度、拓扑全不变，只改坐标。
+        锚点：分量 3D 质心最近的主分量节点（拓扑 xyz 欧氏距离）。
+        空位：以锚点 2D 位置为中心螺旋搜索，包围盒 + clearance 间隙
+        内无线段交叉、无节点穿入（15mm）即为干净；搜不到保持原位记警告。
+        """
+        if len(self._comps) <= 1:
+            return
+        main_keys = set(self._comps[self._main_comp])
+        main_nodes = set()
+        for k in main_keys:
+            main_nodes.update(self.topo.branch_nodes(k))
+        # 其余分量的线段与节点（干涉检查用，全图除本分量）
+        for ci, comp in enumerate(self._comps):
+            if ci == self._main_comp:
+                continue
+            comp_keys = [k for k in comp if k in self.placed]
+            if not comp_keys:
+                continue
+            comp_nodes = set()
+            for k in comp_keys:
+                comp_nodes.update(self.topo.branch_nodes(k))
+            comp_nodes &= set(self.node_pos)
+            # 3D 质心 -> 最近的主分量节点
+            pts3 = [self.topo.nodes[c]['xyz'] for c in comp_nodes
+                    if self.topo.nodes.get(c, {}).get('xyz')]
+            if not pts3:
+                continue
+            cen3 = [sum(p[i] for p in pts3) / len(pts3) for i in range(3)]
+            best_n, best_d = None, 1e18
+            for c in main_nodes:
+                xyz = self.topo.nodes.get(c, {}).get('xyz')
+                if not xyz or c not in self.node_pos:
+                    continue
+                d = math.dist(cen3, xyz)
+                if d < best_d:
+                    best_n, best_d = c, d
+            if best_n is None:
+                continue
+            ax, ay = self.node_pos[best_n]
+            # 本分量 2D 质心与点列
+            comp_pts = []
+            for k in comp_keys:
+                comp_pts.extend(self.placed[k]['points'])
+            if not comp_pts:
+                continue
+            ccx = sum(p[0] for p in comp_pts) / len(comp_pts)
+            ccy = sum(p[1] for p in comp_pts) / len(comp_pts)
+            # 其余线段（包围盒预筛）与节点
+            rest_segs = []
+            for k, res in self.placed.items():
+                if k in comp_keys:
+                    continue
+                pp = res['points']
+                for i in range(len(pp) - 1):
+                    rest_segs.append((pp[i], pp[i + 1]))
+            rest_nodes = {c: p for c, p in self.node_pos.items()
+                          if c not in comp_nodes}
+            comp_segs = []
+            for k in comp_keys:
+                pp = self.placed[k]['points']
+                for i in range(len(pp) - 1):
+                    comp_segs.append((pp[i], pp[i + 1]))
+
+            def _clean(dx, dy):
+                moved = [((a[0] + dx, a[1] + dy), (b[0] + dx, b[1] + dy))
+                         for a, b in comp_segs]
+                xs = [p[0] for s in moved for p in s]
+                ys = [p[1] for s in moved for p in s]
+                x0, x1 = min(xs) - clearance, max(xs) + clearance
+                y0, y1 = min(ys) - clearance, max(ys) + clearance
+                for (a, b) in moved:
+                    for (c, e) in rest_segs:
+                        if (max(c[0], e[0]) < x0 or min(c[0], e[0]) > x1
+                                or max(c[1], e[1]) < y0
+                                or min(c[1], e[1]) > y1):
+                            continue
+                        if seg_proper_intersect(a, b, c, e):
+                            return False
+                        if pt_seg_dist(a, c, e) < 15.0 or pt_seg_dist(
+                                b, c, e) < 15.0:
+                            return False
+                for (nx, ny) in rest_nodes.values():
+                    if not (x0 <= nx <= x1 and y0 <= ny <= y1):
+                        continue
+                    for (a, b) in moved:
+                        if pt_seg_dist((nx, ny), a, b) < 15.0:
+                            return False
+                for c in comp_nodes:
+                    px, py = self.node_pos[c]
+                    qx, qy = px + dx, py + dy
+                    for (a, b) in rest_segs:
+                        if (max(a[0], b[0]) < qx - 15.0
+                                or min(a[0], b[0]) > qx + 15.0
+                                or max(a[1], b[1]) < qy - 15.0
+                                or min(a[1], b[1]) > qy + 15.0):
+                            continue
+                        if pt_seg_dist((qx, qy), a, b) < 15.0:
+                            return False
+                return True
+
+            # 螺旋搜索：半径 50mm 步进，12 个方向
+            found = None
+            r = 50.0
+            while r <= max_radius and found is None:
+                for k in range(12):
+                    ang = math.radians(k * 30.0)
+                    tx, ty = ax + r * math.cos(ang), ay + r * math.sin(ang)
+                    dx, dy = tx - ccx, ty - ccy
+                    if _clean(dx, dy):
+                        found = (dx, dy, r)
+                        break
+                r += 50.0
+            if found is None:
+                self.warnings.append(
+                    f"孤岛分量 {ci}（{comp_keys[0]}）：{max_radius:.0f}mm 内"
+                    f"无干净空位，保持原位")
+                continue
+            dx, dy, r = found
+            old_dist = math.hypot(ccx - ax, ccy - ay)
+            # 落地：平移本分量全部几何状态
+            for c in comp_nodes:
+                px, py = self.node_pos[c]
+                self.node_pos[c] = (px + dx, py + dy)
+            for k in comp_keys:
+                res = self.placed[k]
+                res['points'] = [(x + dx, y + dy) for (x, y) in res['points']]
+                res['joint_pos'] = {i: (x + dx, y + dy)
+                                    for i, (x, y) in res['joint_pos'].items()}
+                res['pieces'] = {sg: ((a[0] + dx, a[1] + dy),
+                                      (b[0] + dx, b[1] + dy))
+                                 for sg, (a, b) in res['pieces'].items()}
+                res['seg_pts'] = {sg: [(x + dx, y + dy) for (x, y) in pts]
+                                  for sg, pts in res['seg_pts'].items()}
+                for sg in res['pieces']:
+                    if sg in self.piece_pos:
+                        (a, b) = self.piece_pos[sg]
+                        self.piece_pos[sg] = ((a[0] + dx, a[1] + dy),
+                                              (b[0] + dx, b[1] + dy))
+            self.placed_pieces = [
+                ((a[0] + dx, a[1] + dy) if k in comp_keys else a,
+                 (b[0] + dx, b[1] + dy) if k in comp_keys else b,
+                 k, sg, sk)
+                for (a, b, k, sg, sk) in self.placed_pieces]
+            if ci < len(self.comp_boxes):
+                (x0, y0, x1, y1) = self.comp_boxes[ci]
+                self.comp_boxes[ci] = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+            self.log_phase('孤岛就近',
+                           f"分量 {ci}（{comp_keys[0]}）3D 最近邻 {best_n}"
+                           f"（{best_d:.1f}mm），2D 从距锚点 {old_dist:.0f}mm"
+                           f" 移到 {r:.0f}mm")
+
     # ---------- 主流程 ----------
     def run(self):
         self.log_phase('开始',
@@ -1541,6 +1985,7 @@ class LayoutV6p1(LayoutV5):
             f"{len(self.layers)} 个关节、槽位 {len(self.slot_info)} 根；"
             f"方案先于放置")
         Layout.run(self)               # 阶段 4：脊线单位布局
+        self.relocate_island_components()  # 孤岛分量就近放置（§十九）
         n_x, n_near, n_ov = count_interference_detailed(self)
         self.log_phase('放置完成', f"残留 X={n_x} 间距<5mm={n_near} 共线重叠={n_ov}")
         # 阶段 5：居中与消交叉交替（最多 5 轮），直至两者同时达标或一轮内无翻转
@@ -1716,10 +2161,15 @@ class LayoutV6p1(LayoutV5):
         （折回即非单调——2026-11-17 实测 flip_center 曾把脊线 7 末根
         Body.89 折回，折后仍共线，共线检查抓不到，必须查单调性）。
         返回 [(spine_id, anchor, end, n_joints, max_dev_mm, mono_ok)]；
-        关节未放置时 max_dev 为 None、mono_ok 为 False。"""
+        关节未放置时 max_dev 为 None、mono_ok 为 False。
+        闭环脊线（§六整体画环）不适用拉直核查：记 0.0/True，清单另注豁免。"""
         out = []
         for s in self.spines:
             joints = s['joints']
+            if s['id'] in self._ring_spines:
+                out.append((s['id'], s['anchor'], s['end'], len(joints),
+                            0.0, True))
+                continue
             a = self.node_pos.get(joints[0])
             b = self.node_pos.get(joints[-1])
             if a is None or b is None:
@@ -1830,6 +2280,12 @@ class LayoutV6p1(LayoutV5):
                 f"{self.topo.branches[k]['length'] - v:.1f}mm"
                 f"（3D {self.topo.branches[k]['length']:.1f}−隐藏 {v:.1f}）"
                 for k, v in sorted(partial_hidden.items()))
+        if self.symbol_segs:
+            adj_txt += '；环弦符号 ' + '、'.join(
+                f"{r['branch']} {r['seg']} {r['length_mm']:.1f}mm"
+                f"（{r['na']}—{r['nb']}，段长<端点距，画小三角符号于 "
+                f"{r['at']}，三角周长=弧长故 1:1 误差 0；§六环优先待实现）"
+                for r in self.symbol_segs)
         h2_pass = max_err <= LEN_ERR_TOL_V6 + 1e-9
         hard.append({
             'id': 'H2', 'rule': '§二.1 长度 1:1', 'name': '长度 1:1',
@@ -1868,7 +2324,8 @@ class LayoutV6p1(LayoutV5):
         })
 
         # H5 全画出（§十五：平行未单画的分支/线段不计入应画数，
-        # 数据在 hidden_parallel，不算漏画）
+        # 数据在 hidden_parallel，不算漏画；§二十二：已排除的过孔零件
+        # 不在拓扑里，应画数按排除后计）
         n_segs_placed = len(self.piece_pos)
         n_segs_total = len(self.topo.segs)
         n_hb = len(self.hidden_whole_branches)
@@ -1876,15 +2333,22 @@ class LayoutV6p1(LayoutV5):
         h5_pass = (st['branches_placed'] == st['branches_total'] - n_hb and
                    st['nodes_placed'] == st['nodes_total'] and
                    n_segs_placed == n_segs_total - n_hs)
+        excl_txt = ''
+        if self.excluded_branches:
+            excl_txt = ('；已排除过孔零件 '
+                        + '、'.join(e['key']
+                                    for e in self.excluded_branches)
+                        + '（§二十二，不画，不计入应画数）')
         hard.append({
-            'id': 'H5', 'rule': '§二 完整性 + §十五 平行对只画一根',
+            'id': 'H5', 'rule': '§二 完整性 + §十五 平行对只画一根 + §二十二 过孔零件排除',
             'name': '全画出',
             'value': (f"分支 {st['branches_placed']}/{st['branches_total']} "
                       f"（平行未单画 {n_hb} 根：{sorted(self.hidden_whole_branches)}），"
                       f"节点 {st['nodes_placed']}/{st['nodes_total']}，"
                       f"线段 {n_segs_placed}/{n_segs_total} "
-                      f"（平行未单画 {n_hs} 段：{sorted(self.hidden_parallel_segs)}）"),
-            'threshold': '全部画出（§十五平行未单画除外，数据记入 hidden_parallel）',
+                      f"（平行未单画 {n_hs} 段：{sorted(self.hidden_parallel_segs)}）"
+                      f"{excl_txt}"),
+            'threshold': '全部画出（§十五平行未单画除外，数据记入 hidden_parallel；§二十二已排除除外）',
             'pass': h5_pass,
         })
 
@@ -2030,21 +2494,28 @@ class LayoutV6p1(LayoutV5):
         # （主干脊线 0 含 30 个关节——29 路径关节＋Body.113 中间关节 CLP01；
         # 其偏差与 H1a 同值，作参照）
         straight = self._spine_straightness()
+        ring_ids = sorted(self._ring_spines)
         worst_dev = max((d for (_i, _a, _e, _n, d, _m) in straight
                          if d is not None), default=None)
         bad_spines = [(i, d) for (i, _a, _e, _n, d, m) in straight
                       if d is None or d > SPINE_STRAIGHT_TOL_MM or not m]
         h10_pass = not bad_spines
         detail = '；'.join(
-            f"脊线{sid} {a or '—'}→{e or '—'}（{n}关节，{d}mm"
+            f"脊线{sid} {a or '—'}→{e or '—'}（{n}关节，"
+            f"{'闭环画环，不计拉直' if sid in ring_ids else f'{d}mm'}"
             f"{'' if m else '，非单调折回'}）"
             for (sid, a, e, n, d, m) in straight)
         hard.append({
             'id': 'H10', 'rule': '§十四 每关节主分支拉直', 'name': '主分支拉直',
             'value': (f"{len(straight)} 条脊线全部关节共线，"
-                      f"最大偏差 {worst_dev}mm；{detail}"),
+                      f"最大偏差 {worst_dev}mm"
+                      + (f"；闭环脊线 {ring_ids} 按 §六整体画环（不计拉直）"
+                         if ring_ids else "")
+                      + f"；{detail}"),
             'threshold': (f"每条脊线关节到脊线垂距 ≤ {SPINE_STRAIGHT_TOL_MM}mm；"
-                          f"关节沿脊线单调（不折回）"),
+                          f"关节沿脊线单调（不折回）"
+                          + ("；闭环脊线按 §六整体画环，不适用本条"
+                             if ring_ids else "")),
             'pass': h10_pass,
         })
 
@@ -2070,12 +2541,25 @@ class LayoutV6p1(LayoutV5):
         rings, self_loops, parallels = self.topo.find_cycles(
             list(self.topo.branches.keys()))
         ring_test = _ring_test_status()
+        if self.rings_drawn:
+            s4_note = ('闭环脊线（首末关节相同）按 §六整体画环：按 3D 弦长排'
+                       '闭合多边形、各边打折补长；非脊线环分支（如主干上的'
+                       'theta 环弦）仍按受约束段处理，环分类单测通过')
+        elif self.excluded_branches:
+            # §二十二：真环被当过孔零件排除了，不要写成 IP 那句
+            s4_note = ('真环 '
+                       + '、'.join(e['key']
+                                   for e in self.excluded_branches)
+                       + ' 为过孔零件（§二十二），已排除不画；'
+                         '其余无真实几何环')
+        else:
+            s4_note = 'IP 无真实几何环，真环画环逻辑未在真实数据上验证（合成单测通过）'
         soft.append({
             'id': 'S4', 'rule': '§六 有环先完整画环', 'name': '环分类',
             'value': (f"真环 {len(rings)} 个，自环 {len(self_loops)} 个，"
                       f"平行对 {len(parallels)} 个；已画真环 {len(self.rings_drawn)} 个；"
                       f"环分类单测 {ring_test}"),
-            'note': 'IP 无真实几何环，真环画环逻辑未在真实数据上验证（合成单测通过）',
+            'note': s4_note,
         })
         s_total, s_matched, _s_mm = self._side_compliance()
         s_rate = (s_matched / s_total * 100.0) if s_total else 0.0
@@ -2122,7 +2606,12 @@ class LayoutV6p1(LayoutV5):
                       f"{max((s['level'] for s in self.spines), default=0)}；"
                       f"尾段 {len(self.tails)} 段（受约束 "
                       f"{sum(1 for t in self.tails if t['kind'] == 'constrained')}、"
-                      f"自由 {sum(1 for t in self.tails if t['kind'] == 'free')}）；"
+                      f"自由 {sum(1 for t in self.tails if t['kind'] == 'free')}"
+                      + (f"、detached "
+                         f"{sum(1 for t in self.tails if t['kind'] == 'detached')}"
+                         if any(t['kind'] == 'detached' for t in self.tails)
+                         else "")
+                      + "）；"
                       f"未进脊线 {len(self.unassigned_branches)} 根"
                       f"{[k for k, _ in self.unassigned_branches]}；"
                       f"§十五平行未单画 {len(self.hidden_parallel)} 对"),
@@ -2159,9 +2648,15 @@ def layout_data_v6p1(layout, include_checklist=None):
     data = layout_data(layout, include_checklist=include_checklist)
     data['meta']['source'] = 'unfold_2d_v6p1.py'
     data['meta']['version'] = 'v6p1'
+    # §二十二：已排除分支（过孔零件等非路径件，不画；合并与查看器认这项）
+    data['meta']['excluded_branches'] = [
+        dict(e) for e in getattr(layout, 'excluded_branches', [])]
     # §十五：平行未单画记录（顶层）+ 保留分支上的标注（供查看器弹窗
     # 展示两根管子的数据）+ 部分隐藏分支的标注（解释 len_2d < len_3d）
     data['hidden_parallel'] = [dict(r) for r in layout.hidden_parallel]
+    # 环弦符号（顶层）：段长 < 端点距的受约束段，画小三角符号于一端；
+    # merge 按自环通道改画小环符号（见 merge_joints_v6p2.py）。
+    data['symbol_segs'] = [dict(r) for r in layout.symbol_segs]
     by_kept = defaultdict(list)
     by_hidden_branch = defaultdict(list)
     for r in layout.hidden_parallel:
@@ -2572,6 +3067,10 @@ def fix_dxf_labels(layout, dxf_path):
 def build_layout(topo, clearance, verbose=True, plan_path=None):
     layout = LayoutV6p1(topo, clearance=clearance, verbose=verbose)
     layout.plan_path = plan_path
+    # §二十二：排除记录从 topo 带到布局（进 layout.json meta，供合并与查看器认）
+    layout.excluded_branches = [
+        {'key': k, 'reason': EXCLUDED_BRANCHES.get(k, '')}
+        for k in getattr(topo, 'dropped_branches', [])]
     layout.run()
     return layout
 
@@ -2602,6 +3101,9 @@ def main():
     args = ap.parse_args()
 
     topo = Topo(args.topo_json)
+    n_b0, n_n0, n_s0 = (len(topo.branches), len(topo.nodes), len(topo.segs))
+    # §二十二：过孔零件等非路径件先删掉再展开（拓扑文件本身不动）
+    dropped = topo.drop_branches(set(EXCLUDED_BRANCHES))
 
     if args.hash_only:
         # 哈希模式：只打印 MD5，不打印其他任何东西
@@ -2610,8 +3112,14 @@ def main():
         print(h)
         return 0
 
-    print(f"输入：分支 {len(topo.branches)} / 节点 {len(topo.nodes)} / "
-          f"线段 {len(topo.segs)}")
+    print(f"输入：分支 {n_b0} / 节点 {n_n0} / "
+          f"线段 {n_s0}")
+    if dropped:
+        print(f"已排除过孔零件 {len(dropped)} 根（§二十二，不画）："
+              + "、".join(
+                  f"{k}（{EXCLUDED_BRANCHES.get(k, '')}）" for k in dropped)
+              + f"；展开用分支 {len(topo.branches)} / 节点 {len(topo.nodes)} "
+              f"/ 线段 {len(topo.segs)}")
     comps = topo.components()
     print(f"连通分量：{len(comps)} 个，规模 {[len(c) for c in comps]}")
     for i, c in enumerate(comps):
